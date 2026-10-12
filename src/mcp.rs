@@ -1158,9 +1158,7 @@ async fn do_query(
             // decision is a pure function of (warming, empty, rerank_rejected) so it is
             // unit-tested directly (see select_empty_or_warming_message).
             if result.results.is_empty() {
-                let rerank_rejected = result.rerank.as_ref().is_some_and(|r| {
-                    !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
-                });
+                let rerank_rejected = result.rerank_rejected_all();
                 return note_both_scopes_searched(
                     select_empty_or_warming_message(
                         result.warming,

@@ -17,7 +17,7 @@ use crate::query::find_db_for_file;
 use crate::query::graph_expand::graph_expand;
 use crate::query::merger::{MergeChunk, merge_chunks};
 use crate::query::reranker;
-use crate::query::scope_fallback::{Gathered, gather_with_fallback};
+use crate::query::scope_fallback::{Gathered, gather_with_fallback, retry_on_rerank_rejection};
 use crate::vector::ScopeFilter;
 
 // ─── Output types ─────────────────────────────────────────────────────────
@@ -81,6 +81,20 @@ pub enum QueryGraphMode {
 impl QueryGraphMode {
     fn uses_call_graph(self) -> bool {
         matches!(self, Self::Full)
+    }
+}
+
+impl QueryResult {
+    /// True when the query ended empty because the reranker ACTIVELY rejected every
+    /// candidate: it ran, returned a real response, and was not skipped or on its
+    /// fallback path. Distinct from "no candidates" (rerank never ran) and from a
+    /// skipped/failed rerank. Single definition shared by the scope retry and the
+    /// MCP "No relevant code found" wording.
+    pub fn rerank_rejected_all(&self) -> bool {
+        self.results.is_empty()
+            && self.rerank.as_ref().is_some_and(|r| {
+                !r.fallback_used && r.skip_reason.is_none() && !r.raw_response.is_empty()
+            })
     }
 }
 
@@ -204,6 +218,9 @@ pub async fn run_query_with_filters(
     .await
 }
 
+/// Full query pipeline with scope handling: runs [`run_query_once`] and, if a
+/// scoped query ends empty because the reranker rejected every candidate, retries
+/// once in the other scope (see `query::scope_fallback`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_query_with_filters_and_mode(
     query: &str,
@@ -222,12 +239,62 @@ pub(crate) async fn run_query_with_filters_and_mode(
     external_filters: Option<crate::query::filters::QueryFilters>,
     graph_mode: QueryGraphMode,
 ) -> Result<QueryResult> {
+    retry_on_rerank_rejection(|forced_scope, allow_gather_fallback| {
+        run_query_once(
+            query,
+            top_k,
+            repo_filter,
+            voyage_client,
+            index_engine,
+            repo_dbs,
+            min_prune_lines,
+            llm_client,
+            warm_wait,
+            agentic_rag,
+            agentic_rag_max_turns,
+            agentic_rag_max_chunk_chars,
+            agentic_rag_grep_read,
+            external_filters.clone(),
+            graph_mode,
+            forced_scope,
+            allow_gather_fallback,
+        )
+    })
+    .await
+}
+
+/// One pass of the pipeline. `forced_scope` (the scope retry) overrides whatever
+/// scope the request carried; `allow_gather_fallback = false` disables the
+/// empty-scope fallback so the retry cannot bounce back where it came from.
+#[allow(clippy::too_many_arguments)]
+async fn run_query_once(
+    query: &str,
+    top_k: usize,
+    repo_filter: Option<&str>,
+    voyage_client: &VoyageClient,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    min_prune_lines: u32,
+    llm_client: Option<&LlmClient>,
+    warm_wait: std::time::Duration,
+    agentic_rag: bool,
+    agentic_rag_max_turns: u32,
+    agentic_rag_max_chunk_chars: u32,
+    agentic_rag_grep_read: bool,
+    external_filters: Option<crate::query::filters::QueryFilters>,
+    graph_mode: QueryGraphMode,
+    forced_scope: Option<crate::vector::Scope>,
+    allow_gather_fallback: bool,
+) -> Result<QueryResult> {
     let total_start = Instant::now();
 
     // ── Step 0: Parse query filters ──────────────────────────────────────────
     let (clean_query, mut filters) = crate::query::filters::parse_query_filters(query);
     if let Some(ext) = external_filters {
         filters.merge(ext);
+    }
+    if let Some(scope) = forced_scope {
+        filters.scope = Some(scope);
     }
     // Use clean query for embedding (filters stripped), or original if clean is empty
     let embed_query = if clean_query.is_empty() {
@@ -250,7 +317,7 @@ pub(crate) async fn run_query_with_filters_and_mode(
     // requested scope yields nothing at all (and the index is not merely warming)
     // the OTHER scope is searched once — see `query::scope_fallback`.
     let current_identity = EmbeddingIdentity::from_client(voyage_client);
-    let served = gather_with_fallback(filters.scope_filter(), |class| {
+    let served = gather_with_fallback(filters.scope_filter(), allow_gather_fallback, |class| {
         gather_candidates(
             &embedding,
             top_k,
