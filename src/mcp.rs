@@ -22,6 +22,8 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
+#[cfg(test)]
+mod availability_tests;
 mod progress;
 pub(crate) mod query_gate;
 pub(crate) mod readiness;
@@ -938,44 +940,108 @@ pub async fn run_codebase_retrieval(
 
     // 4. One shared readiness decision selects both the wait budget and graph
     // mode. MCP and REST therefore cannot drift on the ResolveEdges fast path.
-    let (query_graph_mode, query_warm_wait, output_prefix) = match readiness::await_index_ready(
-        settings,
-        index_engine,
-        repo_dbs,
-        data_dir,
-        repo,
-    )
-    .await
+    let readiness =
+        readiness::await_index_ready(settings, index_engine, repo_dbs, data_dir, repo).await;
+    let request = scoped_request(information_request, scope);
+    let output = match query_with(readiness, index_engine, repo_dbs, settings, &request, repo).await
     {
+        Ok(output) => output,
+        Err(degrade) => return degrade,
+    };
+    if !output.warming_empty {
+        return output.text;
+    }
+    // Nothing could be served yet: no stale snapshot existed after all (cold
+    // worker, no persisted shard of this embedding space), or the warm is waiting
+    // on a run that has to verify the repo first (absent identity marker). Wait
+    // for that run, bounded, and ask once more instead of answering "retry".
+    let budget = Duration::from_secs(settings.mcp_index_wait_secs);
+    let readiness = readiness::wait_for_run(index_engine, repo, budget).await;
+    match query_with(readiness, index_engine, repo_dbs, settings, &request, repo).await {
+        Ok(output) => output.text,
+        Err(degrade) => degrade,
+    }
+}
+
+/// Run the query a readiness decision allows, or return its degrade message.
+async fn query_with(
+    readiness: readiness::IndexReadiness,
+    index_engine: &Arc<IndexEngine>,
+    repo_dbs: &Arc<RwLock<HashMap<String, Surreal<Db>>>>,
+    settings: &Settings,
+    request: &str,
+    repo: &str,
+) -> Result<PrefixedOutput, String> {
+    let (graph_mode, warm_wait, prefix) = match readiness {
         readiness::IndexReadiness::Ready { warm_budget } => (QueryGraphMode::Full, warm_budget, ""),
         readiness::IndexReadiness::ReadyVectorOnly { warm_budget } => (
             QueryGraphMode::VectorOnly,
             warm_budget,
             crate::prompts::MCP_GRAPH_PENDING,
         ),
+        readiness::IndexReadiness::ReadyStale { warm_budget } => (
+            QueryGraphMode::VectorOnly,
+            warm_budget,
+            crate::prompts::MCP_STALE_RESULTS,
+        ),
         readiness::IndexReadiness::Timeout => {
-            return crate::prompts::MCP_DEGRADE_INDEXING.to_string();
+            return Err(crate::prompts::MCP_DEGRADE_INDEXING.to_string());
         }
         readiness::IndexReadiness::Failed(error) => {
             let message = format!("{error:#}");
-            return crate::prompts::render(
+            return Err(crate::prompts::render(
                 crate::prompts::MCP_DEGRADE_INDEX_FAILED,
                 &[("err", &message)],
-            );
+            ));
         }
     };
-
     let output = do_query(
         index_engine,
         repo_dbs,
         settings,
-        &scoped_request(information_request, scope),
+        request,
         repo,
-        query_graph_mode,
-        query_warm_wait,
+        graph_mode,
+        warm_wait,
     )
     .await;
-    format!("{output_prefix}{output}")
+    Ok(PrefixedOutput {
+        warming_empty: output.warming_empty,
+        text: prefix_output(prefix, output),
+    })
+}
+
+/// A finished answer plus whether it is the empty "still warming" retry.
+struct PrefixedOutput {
+    text: String,
+    warming_empty: bool,
+}
+
+/// Prepend the readiness prefix (e.g. "showing vector-only results") unless the
+/// answer carries no results at all because the shard is still warming: there the
+/// prefix contradicts the body, and the retry instruction must stand alone.
+fn prefix_output(prefix: &str, output: QueryOutput) -> String {
+    if output.warming_empty {
+        output.text
+    } else {
+        format!("{prefix}{}", output.text)
+    }
+}
+
+/// What [`do_query`] produced, plus whether it is the empty "still warming,
+/// retry" answer (which callers must not decorate with readiness banners).
+struct QueryOutput {
+    text: String,
+    warming_empty: bool,
+}
+
+impl From<String> for QueryOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            warming_empty: false,
+        }
+    }
 }
 
 /// Prefix the request with the structured scope as an inline `scope:` filter (the
@@ -1110,8 +1176,8 @@ async fn do_query(
     repo: &str,
     graph_mode: QueryGraphMode,
     warm_wait: Duration,
-) -> String {
-    let voyage_client = match VoyageClient::new_for_provider(
+) -> QueryOutput {
+    let voyage_client = match VoyageClient::shared_for_provider(
         crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),
@@ -1119,7 +1185,7 @@ async fn do_query(
         settings.embedding.dimensions,
     ) {
         Ok(c) => c,
-        Err(e) => return format!("Error: failed to create embedding client: {e}"),
+        Err(e) => return format!("Error: failed to create embedding client: {e}").into(),
     };
 
     let llm_client: Option<LlmClient> = LlmClient::new(&settings.llm);
@@ -1148,7 +1214,7 @@ async fn do_query(
     )
     .await
     {
-        Err(e) => format!("Error: query failed: {e}"),
+        Err(e) => format!("Error: query failed: {e}").into(),
         Ok(result) => {
             // Warming takes precedence over the empty-handling: an empty result with
             // `warming` set means the repo's vector shard was not resident after the
@@ -1159,18 +1225,21 @@ async fn do_query(
             // unit-tested directly (see select_empty_or_warming_message).
             if result.results.is_empty() {
                 let rerank_rejected = result.rerank_rejected_all();
-                return note_both_scopes_searched(
-                    select_empty_or_warming_message(
+                return QueryOutput {
+                    text: note_both_scopes_searched(
+                        select_empty_or_warming_message(
+                            result.warming,
+                            rerank_rejected,
+                            information_request,
+                        ),
+                        result.scope.is_some(),
+                        // The engine's early-return paths (no candidates survived)
+                        // are the only ones without rerank info.
+                        result.rerank.is_none(),
                         result.warming,
-                        rerank_rejected,
-                        information_request,
                     ),
-                    result.scope.is_some(),
-                    // The engine's early-return paths (no candidates survived)
-                    // are the only ones without rerank info.
-                    result.rerank.is_none(),
-                    result.warming,
-                );
+                    warming_empty: result.warming,
+                };
             }
             // Snapshot the DB handles for the grep-hint symbol lookup. The read
             // guard is dropped at the end of this block, BEFORE any DB await.
@@ -1231,9 +1300,9 @@ async fn do_query(
                 );
             }
             if result.warming {
-                format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}")
+                format!("{MCP_PARTIAL_RESULTS_PREFIX}{assembled}").into()
             } else {
-                assembled
+                assembled.into()
             }
         }
     }
@@ -1305,7 +1374,7 @@ pub async fn run_file_retrieval(
     }
 
     // Embed the query.
-    let voyage_client = match VoyageClient::new_for_provider(
+    let voyage_client = match VoyageClient::shared_for_provider(
         crate::embedding::voyage::Provider::parse(&settings.embedding.provider),
         settings.embedding.model.clone(),
         settings.embedding.api_keys.clone(),

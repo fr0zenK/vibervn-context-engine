@@ -968,3 +968,449 @@ async fn binary_file_does_not_turn_every_walk_into_an_incremental() {
         .unwrap();
     assert!(meta.chunk_count > 0, "now-text file is chunked");
 }
+
+/// Watcher run touching only `rel` (already stored) as Modified.
+async fn watcher_touch(db: &Surreal<Db>, repo: &str, rel: &str) {
+    let path = key_like(db, repo, "lib.rs", rel).await;
+    pipeline_for(repo)
+        .run(
+            db,
+            Some(vec![FileChange {
+                path,
+                kind: ChangeKind::Modified,
+            }]),
+            false,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("watcher run");
+}
+
+/// Editing a NESTED ignore file must drop the already-stored files it now
+/// excludes: no watcher event will ever arrive for those files themselves.
+#[tokio::test]
+async fn nested_ignore_edit_prunes_stored_files() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    std::fs::create_dir_all(dir.path().join("app/build-tdd")).unwrap();
+    write(&dir, "lib.rs", "fn foo() {}\n");
+    write(&dir, "app/main.rs", "fn main() { foo(); }\n");
+    write(&dir, "app/build-tdd/gen.rs", "fn gen() { foo(); }\n");
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    pipeline_for(&repo)
+        .run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+    assert_eq!(
+        indexed_rels(&db, &repo).await,
+        vec!["app/build-tdd/gen.rs", "app/main.rs", "lib.rs"]
+    );
+
+    write(&dir, "app/.gitignore", "*build-*\n");
+    watcher_touch(&db, &repo, "app/.gitignore").await;
+    assert_eq!(
+        indexed_rels(&db, &repo).await,
+        vec!["app/main.rs", "lib.rs"],
+        "the nested .gitignore edit must prune the artifact"
+    );
+}
+
+/// A DB written before nested-ignore support (no prune marker) holds artifacts
+/// the old root-only watcher filter leaked. The first watcher run prunes them
+/// even though its batch never mentions an ignore file, then records the marker.
+#[tokio::test]
+async fn legacy_db_without_prune_marker_is_pruned_once() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+    std::fs::create_dir_all(dir.path().join("app/build-tdd")).unwrap();
+    write(&dir, "lib.rs", "fn foo() {}\n");
+    write(&dir, "app/build-tdd/gen.rs", "fn gen() { foo(); }\n");
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    pipeline_for(&repo)
+        .run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+    assert!(get_meta(&db, IGNORE_PRUNE_KEY).await.unwrap().is_some());
+
+    // Simulate the legacy state: artifact stored, nested rule present, no marker.
+    write(&dir, "app/.gitignore", "*build-*\n");
+    db.query("DELETE FROM index_meta WHERE key = $k")
+        .bind(("k", IGNORE_PRUNE_KEY))
+        .await
+        .unwrap();
+
+    write(&dir, "lib.rs", "fn foo() { }\n");
+    watcher_touch(&db, &repo, "lib.rs").await;
+    assert_eq!(indexed_rels(&db, &repo).await, vec!["lib.rs"]);
+    assert!(
+        get_meta(&db, IGNORE_PRUNE_KEY).await.unwrap().is_some(),
+        "a successful run records the prune so later batches skip the O(stored) check"
+    );
+}
+
+#[test]
+fn incremental_phase2_budget_needs_both_size_and_share() {
+    let min = INCREMENTAL_PHASE2_FULL_FALLBACK_MIN_FILES;
+    assert!(
+        !exceeds_incremental_phase2_budget(min - 1, min),
+        "small sets stay scoped"
+    );
+    assert!(exceeds_incremental_phase2_budget(min, min * 2));
+    assert!(
+        !exceeds_incremental_phase2_budget(min, min * 100),
+        "a large set in a much larger repo stays scoped"
+    );
+}
+
+/// Defining a name that hundreds of files call pulls them all into the blast
+/// radius (direction 2). Past the budget the run replays the full Phase 2 —
+/// and the call graph must still equal a fresh full rebuild.
+#[tokio::test]
+async fn oversized_blast_radius_falls_back_to_full_phase2() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    write(&dir, "lib.rs", "fn foo() {}\n");
+    let callers = INCREMENTAL_PHASE2_FULL_FALLBACK_MIN_FILES + 4;
+    for i in 0..callers {
+        write(
+            &dir,
+            &format!("c{i}.rs"),
+            &format!("fn c{i}() {{ target(); foo(); }}\n"),
+        );
+    }
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    let p = pipeline_for(&repo);
+    p.run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+
+    write(&dir, "lib.rs", "fn foo() {}\nfn target() {}\n");
+    let lib = stored_key(&db, &repo, "lib.rs").await;
+    let stats = p
+        .run(
+            &db,
+            Some(vec![FileChange {
+                path: lib,
+                kind: ChangeKind::Modified,
+            }]),
+            false,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("incremental run");
+    assert!(
+        stats.incr_p2_full_fallback,
+        "resolve set {} must trigger the fallback",
+        stats.incr_resolve_set_size
+    );
+    assert_eq!(calls_snapshot(&db).await, fresh_full_calls(&repo).await);
+    assert!(get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap().is_some());
+}
+
+/// Cancel used to be ignored for the whole incremental Phase 2 (the UI's Cancel
+/// did nothing for minutes). It must abort between batches.
+#[tokio::test]
+async fn incremental_phase2_honors_cancel() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    write(&dir, "lib.rs", "fn foo() {}\nfn bar() { foo(); }\n");
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    let p = pipeline_for(&repo);
+    p.run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+
+    let lib = stored_key(&db, &repo, "lib.rs").await;
+    let token = CancellationToken::new();
+    token.cancel();
+    let err = p
+        .resolve_edges_incremental_with(&db, &[lib], &[], &[], None, None, Some(&token))
+        .await
+        .expect_err("a cancelled token must abort");
+    assert!(matches!(
+        err.downcast_ref::<PipelineAbort>(),
+        Some(PipelineAbort::Cancelled)
+    ));
+}
+
+/// The state a crash or cancel mid-Phase-2 leaves since the identity marker
+/// commits before Phase 2: identity present, `edges_resolved` absent, `calls`
+/// partial. The next WATCHER run (with changes, not the no-change replay path)
+/// must replay the full Phase 2 — re-resolving only its own blast radius would
+/// stamp `edges_resolved` over a graph still missing the earlier edges — and
+/// must not re-embed anything.
+#[tokio::test]
+async fn run_after_interrupted_phase2_replays_full_graph_without_reembedding() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    write(&dir, "lib.rs", "fn foo() {}\nfn bar() { foo(); }\n");
+    write(&dir, "a.rs", "fn a() { foo(); bar(); }\n");
+    write(&dir, "b.rs", "fn b() { a(); }\n");
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    let p = pipeline_for(&repo);
+    p.run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+    let expected = fresh_full_calls(&repo).await;
+    assert_eq!(calls_snapshot(&db).await, expected);
+
+    // Interrupted Phase 2: the graph of a.rs is gone and the marker is unset.
+    let a = stored_key(&db, &repo, "a.rs").await;
+    db.query("DELETE FROM calls WHERE in_file = $f")
+        .bind(("f", a))
+        .await
+        .unwrap();
+    db.query("DELETE FROM index_meta WHERE key = $k")
+        .bind(("k", EDGES_RESOLVED_KEY))
+        .await
+        .unwrap();
+    let chunks_before = count_rows(&db, "chunk").await;
+
+    write(&dir, "b.rs", "fn b() { a(); }\n// edited\n");
+    let b = stored_key(&db, &repo, "b.rs").await;
+    let stats = p
+        .run(
+            &db,
+            Some(vec![FileChange {
+                path: b,
+                kind: ChangeKind::Modified,
+            }]),
+            false,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        )
+        .await
+        .expect("watcher run");
+    assert!(
+        stats.incr_p2_full_fallback,
+        "a partial prior graph must be replayed in full"
+    );
+    assert_eq!(calls_snapshot(&db).await, expected);
+    assert!(get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap().is_some());
+    assert_eq!(
+        count_rows(&db, "chunk").await,
+        chunks_before,
+        "no full rebuild"
+    );
+}
+
+/// The identity marker commits once the vectors are durable, BEFORE Phase 2. A
+/// cancel (or crash) inside Phase 2 used to roll the published vectors back,
+/// delete the marker and set `needs_rebuild` — a full re-embed for a graph-only
+/// interruption, and meanwhile every warm read "no identity" as a mismatch. Now
+/// only `edges_resolved` stays unset and the next run replays Phase 2.
+#[tokio::test]
+async fn phase2_cancel_keeps_identity_and_vectors() {
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let repo = repo_path(&dir);
+    write(&dir, "lib.rs", "fn foo() {}\nfn bar() { foo(); }\n");
+    write(&dir, "a.rs", "fn a() { foo(); }\n");
+    write(&dir, "b.rs", "fn b() { bar(); }\n");
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    let client = scripted_voyage(|_, n| (axum::http::StatusCode::OK, ok_embeddings(n))).await;
+    let identity = EmbeddingIdentity::from_client(&client).as_key_string();
+    let p = IndexPipeline::new(repo.clone(), Some(client));
+    p.run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("initial full rebuild");
+    assert_eq!(
+        get_meta(&db, EMBEDDING_IDENTITY_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(identity.as_str())
+    );
+
+    // A delete-only batch embeds nothing, so the pre-cancelled token is first
+    // observed inside Phase 2.
+    let b = stored_key(&db, &repo, "b.rs").await;
+    std::fs::remove_file(dir.path().join("b.rs")).unwrap();
+    let token = CancellationToken::new();
+    token.cancel();
+    let err = p
+        .run(
+            &db,
+            Some(vec![FileChange {
+                path: b,
+                kind: ChangeKind::Deleted,
+            }]),
+            false,
+            None,
+            None,
+            None,
+            &[],
+            Some(token),
+        )
+        .await
+        .err()
+        .expect("cancelled inside Phase 2");
+    assert!(matches!(
+        err.downcast_ref::<PipelineAbort>(),
+        Some(PipelineAbort::Cancelled)
+    ));
+    assert_eq!(
+        get_meta(&db, EMBEDDING_IDENTITY_KEY)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(identity.as_str()),
+        "the committed vectors keep their identity"
+    );
+    assert!(get_meta(&db, "needs_rebuild").await.unwrap().is_none());
+    assert!(get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap().is_none());
+
+    p.run(&db, None, false, None, None, None, &[], None)
+        .await
+        .expect("next run replays Phase 2");
+    assert_eq!(calls_snapshot(&db).await, fresh_full_calls(&repo).await);
+    assert!(get_meta(&db, EDGES_RESOLVED_KEY).await.unwrap().is_some());
+}
+
+/// Mirror every indexable file of `src` into `dst` (same relative paths), so a
+/// benchmark can edit files without touching the real repository.
+fn mirror_indexable(src: &str, dst: &std::path::Path) -> usize {
+    let files = crate::indexing::walker::walk_repo(src);
+    for f in &files {
+        let rel = std::path::Path::new(f)
+            .strip_prefix(src)
+            .expect("walked path under root");
+        let to = dst.join(rel);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(f, &to).unwrap();
+    }
+    files.len()
+}
+
+/// ACCEPTANCE BENCH (notepad-ade, ~7 min of incremental Phase 2 for a 23-file
+/// change before the per-file read + to_name index): mirror the repo, full
+/// rebuild, then time incremental Phase 2 for 40 edited C/C++ files in two
+/// shapes — body-only edits (resolve set = the 40 files) and edits that ADD a
+/// commonly-called name (direction-2 expansion). Targets: < 5 s each, and never
+/// slower than the full Phase 2 of the same repo. Run with
+/// `cargo test --release --lib notepad_incremental_phase2_bench -- --ignored --nocapture`
+/// (`NOTEPAD_ADE_REPO` overrides the source path).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn notepad_incremental_phase2_bench() {
+    // Phase-level PERF lines on stderr (RUST_LOG overrides).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("context_engine_rs=info")),
+        )
+        .with_test_writer()
+        .try_init();
+    let src = std::env::var("NOTEPAD_ADE_REPO")
+        .unwrap_or_else(|_| "D:/projects/cpp/notepad-ade".to_string());
+    if !std::path::Path::new(&src).exists() {
+        eprintln!("SKIP: {src} not present");
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
+    let mirrored = mirror_indexable(&src, dir.path());
+    let repo = repo_path(&dir);
+    let db = open_db(home.path(), &repo, 0).await.unwrap();
+    let p = pipeline_for(&repo);
+
+    let full = p
+        .run(&db, None, true, None, None, None, &[], None)
+        .await
+        .expect("full rebuild");
+    eprintln!(
+        "BENCH full rebuild: files={mirrored} phase2_ms={} edges={}",
+        full.phase2_ms, full.phase2_edges_written
+    );
+
+    let mut targets: Vec<String> = get_all_file_meta(&db, &repo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.path)
+        .filter(|p| {
+            let p = p.to_ascii_lowercase();
+            p.ends_with(".cpp") || p.ends_with(".h") || p.ends_with(".c")
+        })
+        .collect();
+    targets.sort();
+    let step = (targets.len() / 40).max(1);
+    let targets: Vec<String> = targets.into_iter().step_by(step).take(40).collect();
+    assert_eq!(targets.len(), 40, "need 40 C/C++ files");
+
+    let edit_and_run = |label: &'static str, suffix: &'static str| {
+        let targets = targets.clone();
+        let db = db.clone();
+        let p = pipeline_for(&repo);
+        async move {
+            let changes: Vec<FileChange> = targets
+                .iter()
+                .map(|t| {
+                    let mut f = std::fs::OpenOptions::new().append(true).open(t).unwrap();
+                    std::io::Write::write_all(&mut f, suffix.as_bytes()).unwrap();
+                    FileChange {
+                        path: t.clone(),
+                        kind: ChangeKind::Modified,
+                    }
+                })
+                .collect();
+            let s = p
+                .run(&db, Some(changes), false, None, None, None, &[], None)
+                .await
+                .expect("incremental run");
+            eprintln!(
+                "BENCH {label}: phase2_ms={} resolve_set={} dir2_ms={} delete_ms={} reresolve_ms={} full_fallback={}",
+                s.incr_phase2_total_ms,
+                s.incr_resolve_set_size,
+                s.incr_p2_dir2_scan_ms,
+                s.incr_p2_delete_calls_ms,
+                s.incr_p2_reresolve_ms,
+                s.incr_p2_full_fallback
+            );
+            s.incr_phase2_total_ms
+        }
+    };
+
+    let body_only = edit_and_run("body-only x40", "\n// bench edit\n").await;
+    let added = edit_and_run(
+        "added common names x40",
+        "\nstatic int size() { return 0; }\nstatic void init() {}\n",
+    )
+    .await;
+
+    // Correctness first, so a timing miss never hides a wrong graph.
+    assert_eq!(
+        calls_snapshot(&db).await,
+        fresh_full_calls(&repo).await,
+        "the incremental graph must equal a fresh full rebuild"
+    );
+    assert!(
+        body_only < 5_000,
+        "body-only incremental Phase 2 took {body_only} ms"
+    );
+    // Allow run-to-run noise on top of the measured full pass.
+    let budget = 5_000u64.max(full.phase2_ms * 5 / 4);
+    assert!(
+        added <= budget,
+        "added-name incremental Phase 2 took {added} ms (full Phase 2: {} ms)",
+        full.phase2_ms
+    );
+}

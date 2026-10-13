@@ -288,15 +288,19 @@ pub struct IndexPipelineStats {
     pub incr_phase2_total_ms: u64,
     /// Phase-2 sub: the `SELECT name FROM symbol WHERE file IN $files` query (ms).
     pub incr_p2_symname_ms: u64,
-    /// Phase-2 sub: the `SELECT from_file FROM raw_edge WHERE to_name IN $names`
-    /// direction-2 expansion scan (ms). PRIME SUSPECT — timed in isolation.
+    /// Phase-2 sub: the per-name `raw_edge WHERE to_name = $n` direction-2
+    /// expansion (ms), timed in isolation.
     pub incr_p2_dir2_scan_ms: u64,
     /// Phase-2 sub: the scoped `DELETE FROM calls` (ms).
     pub incr_p2_delete_calls_ms: u64,
-    /// Phase-2 sub: the raw_edge keyset scan + resolve loop + tail flush (ms).
+    /// Phase-2 sub: the per-file-batch raw_edge read + resolve loop + tail flush
+    /// (ms); the whole full Phase 2 when `incr_p2_full_fallback`.
     pub incr_p2_reresolve_ms: u64,
     /// Phase-2 sub: final `resolve_set.len()` (a count, not a time — explains cost).
     pub incr_resolve_set_size: u64,
+    /// The blast radius exceeded the incremental budget, so the run replayed the
+    /// full Phase 2 instead.
+    pub incr_p2_full_fallback: bool,
 }
 
 /// Per-stage timings produced INSIDE `resolve_edges_incremental` and threaded up
@@ -309,6 +313,41 @@ pub struct Phase2IncrStats {
     pub p2_delete_calls_ms: u64,
     pub p2_reresolve_ms: u64,
     pub resolve_set_size: u64,
+    /// The blast radius was too large for per-file re-resolution, so the run
+    /// replayed the full file-keyset Phase 2 instead.
+    pub full_fallback: bool,
+}
+
+/// Incremental Phase 2 hands off to the full Phase 2 replay once the resolve set
+/// covers more than 1/N of the indexed files. Re-resolving per file pays a scoped
+/// calls delete, a symbol lookup per page and live index maintenance on every
+/// row, while the replay drops the calls indexes and streams raw_edge once — so
+/// the incremental worst case is bounded by one replay.
+///
+/// Measured (`notepad_incremental_phase2_bench`, 2845 files, release): scoped
+/// re-resolution ≈ 74 ms per resolve-set file (378 files: 27.9 s), the replay
+/// ≈ 31 s ≈ 11 ms per indexed file — break-even ≈ 1/7. (A full REBUILD's Phase 2
+/// is cheaper, 13 s, because its raw edges are still in RAM and `calls` is
+/// already empty; neither is true for an incremental run.)
+const INCREMENTAL_PHASE2_FULL_FALLBACK_DIVISOR: usize = 8;
+
+/// The fallback only engages for resolve sets at least this large: below it a
+/// per-file pass is cheap whatever the repo size (40 files: 0.9 s), and small
+/// repos keep the scoped path (and its never-touch-unrelated-edges guarantee).
+const INCREMENTAL_PHASE2_FULL_FALLBACK_MIN_FILES: usize = 64;
+
+/// Files per raw_edge read in incremental Phase 2 (`from_file IN $files`). Bounds
+/// rows held per read to the edges of this many files, independent of the
+/// resolve-set size. `IN` cost grows faster than its list on SurrealDB 2.6.5
+/// (notepad-ade: 2.8 ms/file at 16, 3.9 at 64, 5.0 at 256), so keep it small.
+const INCREMENTAL_PHASE2_FILE_BATCH: usize = 16;
+
+/// `to_name = $n{i}` statements per round trip in the direction-2 expansion.
+const NAME_EXPANSION_BATCH: usize = 64;
+
+fn exceeds_incremental_phase2_budget(resolve_set_len: usize, indexed_files: usize) -> bool {
+    resolve_set_len >= INCREMENTAL_PHASE2_FULL_FALLBACK_MIN_FILES
+        && resolve_set_len.saturating_mul(INCREMENTAL_PHASE2_FULL_FALLBACK_DIVISOR) > indexed_files
 }
 
 /// Per-stage timings produced INSIDE `incremental_run` and threaded up to `run`.
@@ -336,6 +375,37 @@ const EDGES_RESOLVED_KEY: &str = "edges_resolved";
 /// raw_edge, so replaying Phase 2 (or re-resolving an unchanged caller) from the
 /// partial table silently dropped most of the call graph.
 pub(crate) const RAW_EDGE_COMPLETE_KEY: &str = "raw_edge_complete";
+
+/// Set once the stored `file_meta` paths were reconciled with the current ignore
+/// rules (nested ignore files included). Absent on DBs written by builds whose
+/// watcher filter read only the ROOT ignore files: those leaked build artifacts
+/// (e.g. `NotepadADE/build-tdd/**`), which nothing else would ever remove. A
+/// watcher run prunes while this is absent, then records it on success.
+const IGNORE_PRUNE_KEY: &str = "ignore_prune_v1";
+
+/// Stored chunks re-embedded to prove an unmarked index's embedding space.
+const IDENTITY_PROBE_SAMPLES: i64 = 3;
+
+/// Same text, same model: providers return the same vector up to float noise
+/// (cosine ≈ 1). Any other model or dimension lands far below this.
+const IDENTITY_PROBE_MIN_COSINE: f32 = 0.99;
+
+/// Cosine similarity; 0 for empty or different-length vectors.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
 
 /// JSON array of framework resolver names detected by the last whole-repo pass.
 /// Incremental runs only see the changed files, which usually lack the manifest
@@ -365,7 +435,6 @@ const HEAL_PARSE_CHUNK: usize = 1024;
 /// Shared by both full-build and incremental Phase 2 paths.
 #[derive(Deserialize)]
 struct RawEdgeRow {
-    id_str: String,
     from_file: String,
     #[allow(dead_code)]
     from_name: String,
@@ -526,27 +595,136 @@ impl IndexPipeline {
     /// Enter the destructive full-rebuild window while the consumer's per-repo
     /// serialization lock is held. The vector write lock is released before the DB
     /// await (preserving `repo_dbs → vector_index`), but the mutation fence remains
-    /// set so neither query nor warm can expose a shard until publish succeeds.
+    /// set so neither query nor warm can expose a LIVE shard until publish succeeds.
+    ///
+    /// The persisted shard file is deliberately kept: the run's epoch bump already
+    /// makes its content stamp obsolete for every normal warm, and until publish it
+    /// is the only stale snapshot a cold worker can answer queries from
+    /// (`shard_file::open_current_stale`). Publish invalidates it.
     async fn begin_full_vector_update(
         &self,
         vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        captured: Option<(crate::vector::VectorIndex, String)>,
     ) {
         if let Some(vi) = vector_index {
-            vi.write().await.begin_full_update(&self.repo);
+            let mut vi = vi.write().await;
+            vi.begin_full_update(&self.repo);
+            // Same write guard: no query can observe the fence without a snapshot.
+            if let Some((index, identity)) = captured {
+                let count = index.len();
+                if vi.install_stale(&self.repo, index, identity) {
+                    info!(repo = %self.repo, count, "full_rebuild: captured stale snapshot for queries during the rebuild");
+                }
+            }
         }
-        self.invalidate_persisted_shard();
     }
 
-    /// Incremental counterpart: the old shard is removed from search but retained
-    /// privately so unaffected vectors can be re-used when the delta publishes.
+    /// Incremental counterpart: the old shard is removed from the live path but
+    /// retained privately so unaffected vectors can be re-used when the delta
+    /// publishes (and searched as the stale snapshot until then). The persisted
+    /// file is kept for the same reason as in `begin_full_vector_update`.
     async fn begin_incremental_vector_update(
         &self,
         vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        identity_key: Option<&str>,
     ) {
         if let Some(vi) = vector_index {
-            vi.write().await.begin_incremental_update(&self.repo);
+            let mut vi = vi.write().await;
+            vi.begin_incremental_update(&self.repo);
+            if let Some(key) = identity_key {
+                vi.note_incremental_identity(&self.repo, key.to_owned());
+            }
         }
-        self.invalidate_persisted_shard();
+    }
+
+    /// True when a sample of stored chunk vectors is what this run's client
+    /// produces for the same text — i.e. the stored vectors are in this run's
+    /// embedding space. One small embed request; false whenever it cannot be
+    /// shown (no client, no embedded rows, request failure, any sample off).
+    async fn stored_vectors_match_client(&self, db: &Surreal<Db>) -> bool {
+        #[derive(Deserialize)]
+        struct Row {
+            content: String,
+            #[serde(deserialize_with = "crate::store::ops::de_embedding_dual")]
+            embedding: Vec<f32>,
+        }
+        let Some(client) = &self.voyage else {
+            return false;
+        };
+        // A match, not `.and_then(|mut r| r.take(0))`: that closure trips
+        // `clippy::result_large_err` (surrealdb::Error is >140 bytes).
+        let response = db
+            .query("SELECT content, embedding FROM chunk WHERE embedding IS NOT NONE LIMIT $n")
+            .bind(("n", IDENTITY_PROBE_SAMPLES))
+            .await;
+        let rows: Result<Vec<Row>, _> = match response {
+            Ok(mut r) => r.take(0),
+            Err(e) => Err(e),
+        };
+        let rows: Vec<Row> = match rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(repo = %self.repo, error = %e, "identity probe: could not sample stored chunks");
+                return false;
+            }
+        };
+        let rows: Vec<Row> = rows
+            .into_iter()
+            .filter(|r| !r.content.trim().is_empty() && !r.embedding.is_empty())
+            .collect();
+        if rows.is_empty() {
+            return false;
+        }
+        let texts: Vec<String> = rows.iter().map(|r| r.content.clone()).collect();
+        let fresh = match client
+            .embed(&texts, crate::embedding::InputType::Document)
+            .await
+        {
+            Ok(fresh) if fresh.len() == rows.len() => fresh,
+            Ok(_) => return false,
+            Err(e) => {
+                warn!(repo = %self.repo, error = %format!("{e:#}"), "identity probe: embed failed");
+                return false;
+            }
+        };
+        rows.iter()
+            .zip(&fresh)
+            .all(|(row, f)| cosine(&row.embedding, f) >= IDENTITY_PROBE_MIN_COSINE)
+    }
+
+    /// Before a full rebuild deletes everything: if no snapshot of the current
+    /// index is in memory (cold worker) and the rebuild keeps the embedding space,
+    /// load one from the still-intact DB so queries during the rebuild still have
+    /// an answer. Loaded BEFORE the fence and installed by
+    /// `begin_full_vector_update` under the same write guard as the fence, so
+    /// there is no window without a snapshot. One warm-equivalent scan, only on
+    /// cold rebuilds; best-effort.
+    async fn load_stale_snapshot_if_cold(
+        &self,
+        db: &Surreal<Db>,
+        vector_index: Option<&tokio::sync::RwLock<ShardedVectorIndex>>,
+        stored_identity: Option<&str>,
+        identity_key: Option<&str>,
+    ) -> Option<(crate::vector::VectorIndex, String)> {
+        let (Some(vi), Some(key)) = (vector_index, identity_key) else {
+            return None;
+        };
+        {
+            let vi = vi.read().await;
+            if stored_identity != Some(key)
+                || vi.is_resident(&self.repo)
+                || vi.has_stale(&self.repo)
+            {
+                return None;
+            }
+        }
+        match crate::vector::VectorIndex::load_from_db(db).await {
+            Ok(index) => Some((index, key.to_owned())),
+            Err(e) => {
+                warn!(repo = %self.repo, error = %format!("{e:#}"), "full_rebuild: stale snapshot capture failed; queries wait for the rebuild");
+                None
+            }
+        }
     }
 
     /// Fail-closed cleanup after a resident vector publish whose DB commit did not
@@ -627,14 +805,34 @@ impl IndexPipeline {
 
         // Snapshot the REAL client used by this run before any tracker/parse/store
         // work. This same snapshot is used for mixed-index gating, resident publish,
-        // persisted-shard stamp, and the final commit marker.
+        // persisted-shard stamp, and the identity commit marker.
         let run_identity = self.voyage.as_ref().map(EmbeddingIdentity::from_client);
         let stored_identity = get_meta(db, EMBEDDING_IDENTITY_KEY).await?;
+        let mut adopted_identity = false;
         let identity_forces_rebuild = match (&run_identity, &stored_identity) {
             (Some(current), Some(stored)) => current.as_key_string() != *stored,
-            (Some(_), None) => has_data,
+            (Some(current), None) if has_data => {
+                // An ABSENT marker is not a mismatch. Builds before the marker
+                // moved ahead of Phase 2 lost it on every interrupted run (crash,
+                // cancel, a Phase 2 that never finished) — the vectors were fine.
+                // Prove the space by re-embedding a few stored chunks; only an
+                // unprovable or different space still costs a full re-embed.
+                adopted_identity = self.stored_vectors_match_client(db).await;
+                if adopted_identity {
+                    set_meta(db, EMBEDDING_IDENTITY_KEY, &current.as_key_string())
+                        .await
+                        .context("adopt verified embedding identity")?;
+                    info!(repo = %self.repo, "embedding identity marker was missing; stored vectors verified against the client and the marker restored (no re-embed)");
+                }
+                !adopted_identity
+            }
+            (Some(_), None) => false,
             (None, _) => false,
         };
+        // The interrupted run that lost the marker may have left files half
+        // processed (no file_meta): walk the repo so every one is reconciled,
+        // whatever change set the trigger carried.
+        let changes = if adopted_identity { None } else { changes };
 
         // `changes=None` is manual/poll mode and may discover changes after walking;
         // treat it as potentially mutating. An explicitly-empty watcher set is the
@@ -689,6 +887,8 @@ impl IndexPipeline {
                     run_identity_key.as_deref(),
                 )
                 .await?;
+            // The rebuild's walk applied every ignore file: nothing left to prune.
+            set_meta(db, IGNORE_PRUNE_KEY, "1").await?;
             let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
             info!(
                 repo = %self.repo,
@@ -758,6 +958,7 @@ impl IndexPipeline {
         // change set is watcher-supplied (no walk performed).
         let walk_start = Instant::now();
         let mut incr_walk_ms: u64 = 0;
+        let ignore_pruned = get_meta(db, IGNORE_PRUNE_KEY).await?.is_some();
         let file_changes = match changes {
             Some(explicit) => {
                 // Watcher-supplied explicit change set: skip the full walk. Event
@@ -766,14 +967,49 @@ impl IndexPipeline {
                 // from stored_meta (already loaded above).
                 let stored_paths: HashSet<String> =
                     stored_meta.iter().map(|m| m.path.clone()).collect();
-                normalize_explicit_changes(
+                // An edited ignore file can exclude files that are already stored,
+                // and no event will ever arrive for them. Re-check every stored
+                // path then (and once on DBs that predate nested-ignore support).
+                let prune = !ignore_pruned || explicit.iter().any(|c| is_ignore_file(&c.path));
+                let mut changes = normalize_explicit_changes(
                     &self.repo,
                     explicit,
                     &stored_paths,
                     &self.extra_extensions,
                     &self.ignore_filenames,
                     &self.ignore_paths,
-                )
+                );
+                if prune {
+                    let repo = self.repo.clone();
+                    let ext = self.extra_extensions.clone();
+                    let names = self.ignore_filenames.clone();
+                    let paths = self.ignore_paths.clone();
+                    let pruned = tokio::task::spawn_blocking(move || {
+                        now_ignored_deletions(
+                            std::path::Path::new(&repo),
+                            &stored_paths,
+                            ext,
+                            names,
+                            paths,
+                        )
+                    })
+                    .await
+                    .context("ignore prune spawn_blocking")?;
+                    if !pruned.is_empty() {
+                        info!(repo = %self.repo, files = pruned.len(), "pruning stored files now excluded by ignore rules");
+                    }
+                    let already_deleted: HashSet<String> = changes
+                        .iter()
+                        .filter(|c| c.kind == ChangeKind::Deleted)
+                        .map(|c| c.path.clone())
+                        .collect();
+                    changes.extend(
+                        pruned
+                            .into_iter()
+                            .filter(|c| !already_deleted.contains(&c.path)),
+                    );
+                }
+                changes
             }
             None => {
                 // Manual/poll incremental: must walk to detect changes.
@@ -874,6 +1110,9 @@ impl IndexPipeline {
                     .await
                     .context("edges Phase 2 replay on no-change run")?;
             }
+            if !ignore_pruned {
+                set_meta(db, IGNORE_PRUNE_KEY, "1").await?;
+            }
             let indexed = stored_meta.len() as u64;
             let total_files = stored_meta.len() as u64;
             return Ok(IndexPipelineStats {
@@ -910,8 +1149,14 @@ impl IndexPipeline {
                 key_hints,
                 cancel_token.as_ref(),
                 run_identity_key.as_deref(),
+                stored_meta.len(),
             )
             .await?;
+        // Both change-set shapes reconciled stored files with the ignore rules:
+        // the walk emits Deleted for unwalked paths, the watcher path pruned above.
+        if !ignore_pruned {
+            set_meta(db, IGNORE_PRUNE_KEY, "1").await?;
+        }
 
         let post_meta_start = Instant::now();
         let indexed = get_all_file_meta(db, &self.repo).await?.len() as u64;
@@ -941,6 +1186,7 @@ impl IndexPipeline {
             incr_p2_delete_calls_ms = p2.p2_delete_calls_ms,
             incr_p2_reresolve_ms = p2.p2_reresolve_ms,
             incr_resolve_set_size = p2.resolve_set_size,
+            incr_p2_full_fallback = p2.full_fallback,
             incr_vi_apply_ms,
             incr_post_meta_ms,
             files = indexed,
@@ -961,6 +1207,7 @@ impl IndexPipeline {
             incr_p2_delete_calls_ms: p2.p2_delete_calls_ms,
             incr_p2_reresolve_ms: p2.p2_reresolve_ms,
             incr_resolve_set_size: p2.resolve_set_size,
+            incr_p2_full_fallback: p2.full_fallback,
             ..Default::default()
         })
     }
@@ -1094,7 +1341,11 @@ impl IndexPipeline {
         // Enter the fail-closed mutation window BEFORE deleting any durable row.
         // The caller holds the per-repo run lock; query sees Cold and warm install
         // is rejected until the replacement publish atomically releases the fence.
-        self.begin_full_vector_update(vector_index).await;
+        let stored_identity = get_meta(db, EMBEDDING_IDENTITY_KEY).await?;
+        let captured = self
+            .load_stale_snapshot_if_cold(db, vector_index, stored_identity.as_deref(), identity_key)
+            .await;
+        self.begin_full_vector_update(vector_index, captured).await;
         db.query("DELETE FROM index_meta WHERE key IN $keys")
             .bind((
                 "keys",
@@ -1144,11 +1395,26 @@ impl IndexPipeline {
             .await
             .context("full_rebuild: set raw_edge_complete")?;
 
-        // Stage 3 has durably committed chunks, raw_edge rows (or bounded RAM raw
-        // edges), and file_meta commit markers. Publish the vector shard now so
-        // MCP can answer vector-only while Phase 2 builds the call graph. If the
-        // process dies during Phase 2, this RAM shard is lost and the existing
-        // edges_resolved/raw_edge recovery path remains the source of truth.
+        // Stage 3 has durably committed chunks, raw_edge rows, and file_meta commit
+        // markers: the vectors ARE this embedding space from here on, so commit
+        // the identity marker now — Phase 2 only rewrites `calls`, which
+        // `edges_resolved` tracks on its own. Committing it last (after Phase 2)
+        // made a warm during Phase 2 read "no identity" as a mismatch and queue a
+        // full re-embed, and turned a crash or cancel mid-Phase-2 into a full
+        // re-embed instead of a Phase 2 replay.
+        if let Some(key) = identity_key
+            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
+                .await
+                .context("commit embedding_identity marker")
+        {
+            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                .await;
+            return Err(e);
+        }
+
+        // Publish the vector shard now so MCP can answer vector-only while Phase 2
+        // builds the call graph. If the process dies during Phase 2, this RAM shard
+        // is lost; the next warm rebuilds it from the committed chunks.
         let vi_publish_ms = if let Some(identity_key) = identity_key {
             self.publish_full_vectors(vector_index, &chunk_vectors, identity_key)
                 .await
@@ -1180,16 +1446,10 @@ impl IndexPipeline {
                     .await
                     .context("full_rebuild: resolve_edges_phase2")
             };
-        let p2 = match phase2_result {
-            Ok(stats) => stats,
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
-            }
-        };
+        // A Phase 2 failure leaves the committed chunks and the published shard
+        // valid; `edges_resolved` stays unset, so the next run replays Phase 2
+        // from the complete raw_edge table.
+        let p2 = phase2_result?;
         let phase2_ms = phase2_start.elapsed().as_millis() as u64;
         stats.phase2_ms = phase2_ms;
         stats.phase2_sym_load_ms = p2.sym_load_ms;
@@ -1204,18 +1464,6 @@ impl IndexPipeline {
                 repo: self.repo.clone(),
                 elapsed_ms: phase2_ms,
             });
-        }
-
-        // LAST commit marker: every chunk/file_meta row and all resolved edges are
-        // durable before the run identity becomes authoritative.
-        if let Some(key) = identity_key
-            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
-                .await
-                .context("commit embedding_identity marker")
-        {
-            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                .await;
-            return Err(e);
         }
 
         Ok(stats)
@@ -1234,6 +1482,7 @@ impl IndexPipeline {
         key_hints: &[String],
         cancel_token: Option<&CancellationToken>,
         identity_key: Option<&str>,
+        indexed_files: usize,
     ) -> Result<(IncrementalRunStats, u64)> {
         let pre_publish_generation = self.data_dir.as_ref().and_then(|data_dir| {
             let root = crate::vector::shard_file::repo_shard_root(data_dir, &self.repo);
@@ -1272,8 +1521,14 @@ impl IndexPipeline {
         // `calls` deletion is deferred to resolve_edges_incremental, scoped to the
         // computed resolve_set — wiping incoming edges here (as the OR-deleting
         // bulk helper does) is exactly the blow-up we are fixing.
+        // Whether the previous run left a complete call graph. If its Phase 2 was
+        // interrupted (crash, cancel, failure), `calls` is partial beyond this run's
+        // blast radius, so this run must replay the full Phase 2 instead.
+        let prior_graph_complete = get_meta(db, EDGES_RESOLVED_KEY).await?.is_some();
+
         let delete_bulk_start = Instant::now();
-        self.begin_incremental_vector_update(vector_index).await;
+        self.begin_incremental_vector_update(vector_index, identity_key)
+            .await;
         db.query("DELETE FROM index_meta WHERE key IN $keys")
             .bind((
                 "keys",
@@ -1323,11 +1578,25 @@ impl IndexPipeline {
             .context("incremental_run: drop deleted files from pending_retry")?;
 
         // Stage 3 has durably committed the changed files' chunks/raw_edges and
-        // removed deleted files' durable file_meta anchors. Publish the in-memory
-        // vector delta before Phase 2 so MCP can answer vector-only while `calls`
-        // is being rebuilt. The existing file_meta/raw_edge markers remain the
-        // crash-recovery source of truth; this shard is RAM-only and disappears on
-        // restart.
+        // removed deleted files' durable file_meta anchors: every stored vector is
+        // in this run's embedding space, so the identity marker commits HERE, not
+        // after Phase 2 (which only rewrites `calls`, tracked by `edges_resolved`).
+        // Committing it last made a warm during Phase 2 read "no identity" as a
+        // mismatch and queue a full re-embed, and turned a crash or cancel
+        // mid-Phase-2 into a full re-embed instead of a Phase 2 replay.
+        if let Some(key) = identity_key
+            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
+                .await
+                .context("commit embedding_identity marker")
+        {
+            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
+                .await;
+            return Err(e);
+        }
+
+        // Publish the in-memory vector delta before Phase 2 so MCP can answer
+        // vector-only while `calls` is being rebuilt. This shard is RAM-only; after
+        // a restart the next warm rebuilds it from the committed chunks.
         let vi_apply_ms = if let Some(key) = identity_key {
             self.publish_incremental_vectors(vector_index, &all_affected, &chunk_vectors, key)
                 .await
@@ -1336,27 +1605,29 @@ impl IndexPipeline {
         };
         drop(chunk_vectors);
 
+        // From here on only the call graph is in flight. A failure returns without
+        // rolling the vectors back: they are committed and valid, and
+        // `edges_resolved` (cleared at the start of this run) stays unset, so the
+        // next run replays Phase 2 — see `prior_graph_complete`.
+
         // ── Compute the surface delta now that NEW symbols are written ──────────
         // removed_surface_files = modified files that LOST/MOVED a (name,fqn) pair,
         // plus every deleted file (these gate direction-1). added_names = leaf names
         // that gained a (name,fqn) pair (these gate direction-2). A pure-addition or
         // surface-unchanged file appears in NEITHER gate's file set.
         let surface_start2 = Instant::now();
-        let new_surface = match load_file_surface(db, &to_process)
+        let new_surface = load_file_surface(db, &to_process)
             .await
-            .context("incremental_run: load new symbol surface")
-        {
-            Ok(surface) => surface,
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
-            }
-        };
+            .context("incremental_run: load new symbol surface")?;
         let delta = compute_surface_delta(&old_surface, &new_surface, &to_process, &to_delete);
         run_stats.surface_delta_ms += surface_start2.elapsed().as_millis() as u64;
+
+        // Re-resolving the blast radius reads unchanged callers' raw edges, which
+        // only exist when raw_edge is complete. Without the flag (a DB written by a
+        // build that kept raw edges RAM-only) heal the whole graph instead of
+        // re-resolving from a partial table, which would drop those callers' edges.
+        let raw_edge_complete = get_meta(db, RAW_EDGE_COMPLETE_KEY).await?.is_some();
+        let scoped_phase2 = raw_edge_complete && prior_graph_complete;
 
         // ── Direction-1: callers pointing INTO a file that REMOVED/MOVED a symbol ─
         // Only a file that LOST a `(name, fqn)` pair (or was deleted) can have
@@ -1367,17 +1638,19 @@ impl IndexPipeline {
         // and stay out of the resolve_set. Pure additions are handled solely by
         // direction-2 (`added_names`). The query runs against the still-intact
         // `calls` table (the incremental delete left `calls` untouched). Skipped
-        // entirely when nothing was removed — the common comment/add-symbol cases.
+        // entirely when nothing was removed — the common comment/add-symbol cases —
+        // and when Phase 2 is not scoped (a full replay needs no blast radius).
         let predelete_start = Instant::now();
-        let dir1_callers: Vec<String> = if delta.removed_surface_files.is_empty() {
+        let dir1_callers: Vec<String> = if !scoped_phase2 || delta.removed_surface_files.is_empty()
+        {
             Vec::new()
         } else {
             #[derive(Deserialize)]
             struct CallerRow {
                 in_file: String,
             }
-            let rows_result: Result<Vec<CallerRow>> = async {
-                db.query(
+            let rows: Vec<CallerRow> = db
+                .query(
                     "SELECT in_file FROM calls \
                      WHERE out_file IN $changed AND in_file NOT IN $affected \
                      GROUP BY in_file",
@@ -1387,24 +1660,7 @@ impl IndexPipeline {
                 .await
                 .context("incremental_run: direction-1 caller query")?
                 .take(0)
-                .context("incremental_run: decode direction-1 callers")
-            }
-            .await;
-            let rows = match rows_result {
-                Ok(rows) => rows,
-                Err(e) => {
-                    if let Some(key) = identity_key {
-                        self.rollback_published_vectors(
-                            db,
-                            vector_index,
-                            key,
-                            pre_publish_generation,
-                        )
-                        .await;
-                    }
-                    return Err(e);
-                }
-            };
+                .context("incremental_run: decode direction-1 callers")?;
             rows.into_iter().map(|r| r.in_file).collect()
         };
         run_stats.predelete_callers_ms = predelete_start.elapsed().as_millis() as u64;
@@ -1423,51 +1679,43 @@ impl IndexPipeline {
             });
         }
         let phase2_start = Instant::now();
-        // Re-resolving the blast radius reads unchanged callers' raw edges, which
-        // only exist when raw_edge is complete. Without the flag (a DB written by a
-        // build that kept raw edges RAM-only) heal the whole graph instead of
-        // re-resolving from a partial table, which would drop those callers' edges.
-        let raw_edge_complete = match get_meta(db, RAW_EDGE_COMPLETE_KEY).await {
-            Ok(v) => v.is_some(),
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
-            }
-        };
-        let phase2_result = if raw_edge_complete {
-            match self
-                .resolve_edges_incremental(db, &all_affected, &dir1_callers, &delta.added_names)
+        let phase2_stats = if scoped_phase2 {
+            let stats = self
+                .resolve_edges_incremental_with(
+                    db,
+                    &all_affected,
+                    &dir1_callers,
+                    &delta.added_names,
+                    Some(indexed_files),
+                    progress,
+                    cancel_token,
+                )
                 .await
-                .context("incremental_run: resolve_edges_incremental")
-            {
-                // `incremental_run` cleared `edges_resolved` before deleting; restamp
-                // it now that the blast radius is re-resolved. Leaving it absent made
-                // the next no-change run replay Phase 2 over the whole table.
-                Ok(stats) => set_meta(db, EDGES_RESOLVED_KEY, "1")
-                    .await
-                    .context("incremental_run: set edges_resolved")
-                    .map(|_| stats),
-                Err(e) => Err(e),
+                .context("incremental_run: resolve_edges_incremental")?;
+            // `incremental_run` cleared `edges_resolved` before deleting; restamp
+            // it now that the blast radius is re-resolved. Leaving it absent made
+            // the next no-change run replay Phase 2 over the whole table.
+            set_meta(db, EDGES_RESOLVED_KEY, "1")
+                .await
+                .context("incremental_run: set edges_resolved")?;
+            stats
+        } else if raw_edge_complete {
+            info!(repo = %self.repo, "incremental: previous Phase 2 incomplete — replaying full Phase 2");
+            let replay_start = Instant::now();
+            self.resolve_edges_phase2(db, progress, cancel_token)
+                .await
+                .context("incremental_run: Phase 2 replay")?;
+            Phase2IncrStats {
+                p2_reresolve_ms: replay_start.elapsed().as_millis() as u64,
+                full_fallback: true,
+                ..Default::default()
             }
         } else {
             info!(repo = %self.repo, "incremental: raw_edge incomplete — healing call graph");
             self.heal_edges(db, progress, cancel_token)
                 .await
-                .context("incremental_run: heal_edges")
-                .map(|_| Phase2IncrStats::default())
-        };
-        let phase2_stats = match phase2_result {
-            Ok(stats) => stats,
-            Err(e) => {
-                if let Some(key) = identity_key {
-                    self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                        .await;
-                }
-                return Err(e);
-            }
+                .context("incremental_run: heal_edges")?;
+            Phase2IncrStats::default()
         };
         run_stats.phase2_total_ms = phase2_start.elapsed().as_millis() as u64;
         run_stats.phase2 = phase2_stats;
@@ -1476,18 +1724,6 @@ impl IndexPipeline {
                 repo: self.repo.clone(),
                 elapsed_ms: run_stats.phase2_total_ms,
             });
-        }
-
-        // LAST commit marker for the incremental path, after changed chunks,
-        // file_meta, and resolved edges are durable.
-        if let Some(key) = identity_key
-            && let Err(e) = set_meta(db, EMBEDDING_IDENTITY_KEY, key)
-                .await
-                .context("commit embedding_identity marker")
-        {
-            self.rollback_published_vectors(db, vector_index, key, pre_publish_generation)
-                .await;
-            return Err(e);
         }
 
         Ok((run_stats, vi_apply_ms))
@@ -2138,9 +2374,13 @@ impl IndexPipeline {
         // No data loss; file_meta crash-safety ordering is untouched.
         if is_full_rebuild {
             let t_sym_idx_drop = Instant::now();
+            // `idx_raw_edge_to_name` rides along: the bulk raw_edge write is just as
+            // large, and only incremental Phase 2 reads it (rebuilt after the raw_edge
+            // tail flush below; crash recovery via store::ensure_secondary_indexes).
             db.query(
                 "REMOVE INDEX IF EXISTS idx_symbol_file ON symbol; \
-                 REMOVE INDEX IF EXISTS idx_symbol_name ON symbol;",
+                 REMOVE INDEX IF EXISTS idx_symbol_name ON symbol; \
+                 REMOVE INDEX IF EXISTS idx_raw_edge_to_name ON raw_edge;",
             )
             .await
             .context("streaming_index: drop symbol indexes")?;
@@ -2487,6 +2727,18 @@ impl IndexPipeline {
                 .context("streaming_index: tail raw_edge batch")?;
             rawedge_ns += t_re.elapsed().as_nanos() as u64;
         }
+        // Last raw_edge write of a full rebuild: rebuild the name index dropped
+        // before the bulk write, before the tail file_meta commits this run.
+        if is_full_rebuild {
+            let t_re_idx = Instant::now();
+            let (index, table, field) = crate::store::RAW_EDGE_NAME_INDEX;
+            build_index_concurrently(db, index, table, field)
+                .await
+                .context("streaming_index: build idx_raw_edge_to_name")?;
+            let raw_edge_idx_ms = t_re_idx.elapsed().as_millis() as u64;
+            sym_idx_rebuild_ms += raw_edge_idx_ms;
+            info!(repo = %self.repo, raw_edge_idx_ms, "stage3: rebuilt idx_raw_edge_to_name concurrently (full rebuild)");
+        }
         if !pending_file_metas.is_empty() {
             let t_fm = Instant::now();
             for fm in pending_file_metas {
@@ -2745,52 +2997,33 @@ impl IndexPipeline {
     ///   edge count.  This is the legitimate fix for the prior O(N²) per-page symbol
     ///   subquery; the map must stay.
     ///
-    /// Pass 2 — compound keyset scan over raw_edge (O(N) total via index seek):
-    ///   Pages through `raw_edge` using a compound keyset on `(from_file, id_str)`:
+    /// Pass 2 — one ordered scan over raw_edge (O(N) total via idx_raw_edge_from_file):
     ///
     ///   ```text
-    ///   SELECT type::string(id) AS id_str, from_file, from_name, from_fqn,
-    ///          to_name, kind, line, import_path
+    ///   SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path
     ///   FROM raw_edge
     ///   WHERE from_file > $last_file
-    ///      OR (from_file = $last_file AND type::string(id) > $last_id)
-    ///   ORDER BY from_file, id_str
+    ///   ORDER BY from_file
     ///   LIMIT $page
     ///   ```
     ///
-    ///   ORDER BY uses `id_str` (the projected alias for `type::string(id)`).
-    ///   SurrealDB 2.6.5 requires ORDER BY fields to appear in the SELECT list; it
-    ///   rejects bare function calls (`type::string(id)`) and the native `id` field
-    ///   unless explicitly included in SELECT.  Since `id_str` is already selected,
-    ///   `ORDER BY id_str` is accepted.  The WHERE tiebreaker `type::string(id) > $last_id`
-    ///   and ORDER BY `id_str` compare the same string values — perfectly consistent,
-    ///   no rows skipped or duplicated.
-    ///
-    ///   The `from_file > $last_file` branch lets SurrealDB seek via
-    ///   `idx_raw_edge_from_file` (defined in schema.rs) — O(log N) per boundary
-    ///   lookup, O(N) total over all pages.  `id_str` (= type::string(id)) is unique
-    ///   per row, so `(from_file, id_str)` is a unique compound key; every row is
-    ///   visited exactly once with no skip or duplicate hazard.
-    ///
-    ///   Start with `last_file = ""` and `last_id = ""` (empty strings sort before all
-    ///   real values).  After each page, advance:
-    ///
-    ///   ```text
-    ///   last_file = batch.last().from_file
-    ///   last_id   = batch.last().id_str
-    ///   ```
+    ///   Start with `last_file = ""` (sorts before every real path). The last file of
+    ///   a full page may continue past it, so its partial rows are dropped and the
+    ///   file is re-read whole by `from_file = $file`; `last_file` then advances to it.
+    ///   Every file is processed exactly once, no row is skipped.
     ///
     ///   Each page is resolved in-memory against the symbol map and accumulated into
-    ///   `edge_batch`.  `edge_batch` flushes at WRITE_BATCH_SIZE, so peak memory is
-    ///   bounded by: symbol map + one raw_edge page + at most WRITE_BATCH_SIZE resolved
-    ///   edges — independent of total raw_edge count and safe at Linux/Chromium scale.
+    ///   `edge_batch`, flushed at EDGE_RELATE_BATCH_SIZE, so peak memory is bounded
+    ///   by: symbol map + one page + one file's edges + one flush batch —
+    ///   independent of total raw_edge count and safe at Linux/Chromium scale.
     ///
     /// NOTE: OFFSET pagination (`START $offset`) is O(N²) — to fetch page i the DB
     /// walks and discards i×page_size rows.  It must NOT be used here.
     /// NOTE: keyset on `type::string(id) > $cursor` alone was measured as O(N²) in
     /// SurrealDB 2.6.5 (145 s for 34 pages) because the function-call predicate cannot
-    /// use any index.  The compound `from_file > $last_file` branch is what enables
-    /// the index seek and achieves O(N) total.
+    /// use any index; so was a `GROUP BY from_file` outer step (it groups every
+    /// remaining row per page). Only the plain `from_file > $last_file` range is
+    /// index-served.
     ///
     /// Writes the `edges_resolved` marker in `index_meta` only after all pages commit.
     async fn resolve_edges_phase2(
@@ -2802,7 +3035,24 @@ impl IndexPipeline {
         use serde::Deserialize;
         let mut p2 = Phase2Stats::default();
 
-        // First delete all existing calls edges (we're rewriting them from raw_edge).
+        // Drop all 4 calls indexes before touching any calls row: both the whole-table
+        // delete below and the bulk RELATE flush would otherwise maintain 4 index
+        // entries per row (~4 × 97K updates for the delete alone: 18 s of a 55 s
+        // notepad-ade replay). Rebuilt synchronously after all RELATEs commit; a crash
+        // in between is repaired by `store::ensure_secondary_indexes` on open.
+        let t_idx_drop = Instant::now();
+        db.query(
+            "REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
+             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
+        )
+        .await
+        .context("phase2: drop calls indexes")?;
+        p2.idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64;
+        info!(repo = %self.repo, idx_drop_ms = p2.idx_drop_ms, "phase2: dropped calls indexes");
+
+        // Then delete all existing calls edges (we're rewriting them from raw_edge).
         db.query("DELETE FROM calls")
             .await
             .context("phase2: delete calls")?;
@@ -2826,6 +3076,18 @@ impl IndexPipeline {
         }
 
         if total == 0 {
+            // The indexes were dropped above; on the now-empty table the rebuild is
+            // instant, and leaving them absent would full-scan every query.
+            for (index, field) in [
+                ("idx_calls_in_file", "in_file"),
+                ("idx_calls_out_file", "out_file"),
+                ("idx_calls_in_name", "in_name"),
+                ("idx_calls_out_name", "out_name"),
+            ] {
+                build_index_concurrently(db, index, "calls", field)
+                    .await
+                    .with_context(|| format!("phase2: rebuild {index} (empty)"))?;
+            }
             set_meta(db, EDGES_RESOLVED_KEY, "1")
                 .await
                 .context("phase2: set edges_resolved marker (empty)")?;
@@ -2859,46 +3121,21 @@ impl IndexPipeline {
         }
         p2.bucket_build_ms = t_bucket.elapsed().as_millis() as u64;
 
-        // Drop all 4 calls indexes before the bulk RELATE flush to eliminate per-insert
-        // index maintenance overhead (~4 index updates × 77K rows). Rebuild synchronously
-        // after all RELATEs are committed — much faster than writing through live indexes.
-        // This is the same drop→bulk-write→rebuild trick used in the old in-memory path.
-        let t_idx_drop = Instant::now();
-        db.query(
-            "REMOVE INDEX IF EXISTS idx_calls_in_file  ON calls; \
-             REMOVE INDEX IF EXISTS idx_calls_out_file ON calls; \
-             REMOVE INDEX IF EXISTS idx_calls_in_name  ON calls; \
-             REMOVE INDEX IF EXISTS idx_calls_out_name ON calls;",
-        )
-        .await
-        .context("phase2: drop calls indexes")?;
-        p2.idx_drop_ms = t_idx_drop.elapsed().as_millis() as u64;
-        info!(repo = %self.repo, idx_drop_ms = p2.idx_drop_ms, "phase2: dropped calls indexes");
-
-        // Stream raw_edge in O(N) passes via file-keyset pagination.
+        // Stream raw_edge in ONE ordered pass over idx_raw_edge_from_file.
         //
-        // Strategy: paginate the outer loop by `from_file` (the indexed field), processing
-        // all edges for one file before advancing to the next.  This avoids any secondary
-        // sort on a computed field (type::string(id)) that cannot use an index and would
-        // cause O(N²) full-table scans.
+        // Each page is `WHERE from_file > $cursor ORDER BY from_file LIMIT $page` —
+        // the rows themselves, no GROUP BY. The last file of a full page may continue
+        // past it, so its partial rows are dropped and that file is re-read whole by
+        // equality; the cursor then moves past it. Every row is read about once.
         //
-        // Outer step: get the next `from_file` value via:
-        //   SELECT from_file FROM raw_edge WHERE from_file > $cursor
-        //   GROUP BY from_file ORDER BY from_file LIMIT $batch_files
-        //   → uses idx_raw_edge_from_file; O(log N) seek per file boundary.
+        // The previous outer step, `SELECT from_file … GROUP BY from_file ORDER BY
+        // from_file LIMIT 256`, grouped every remaining row for each page: measured
+        // 3.8 s per page on notepad-ade (178K raw edges), ~24 s of a 55 s replay,
+        // while the ordered walk over the whole table takes ~2 s.
         //
-        // Inner fetch: for each file, fetch all its edges via:
-        //   SELECT ... FROM raw_edge WHERE from_file = $file
-        //   → simple equality on the indexed field; O(edges_per_file).
-        //
-        // Memory: symbol map (3.3 MB) + max(edges_per_file) rows + at most
-        //   WRITE_BATCH_SIZE resolved edges — independent of total raw_edge count.
-        //
-        // O(N) total: O(distinct_files) outer seeks + O(total_edges) inner reads.
-        //
-        // File-batch size: fetch FILE_BATCH_SIZE distinct files per outer query to amortise
-        // the outer round-trip overhead (2464 files / FILE_BATCH_SIZE = few outer calls).
-        const FILE_BATCH_SIZE: i64 = 256;
+        // Memory: symbol map + one page + one file's edges + at most
+        // EDGE_RELATE_BATCH_SIZE resolved edges — independent of total raw_edge count.
+        const RAW_EDGE_SCAN_PAGE: i64 = 2048;
 
         let t_load_start = Instant::now();
         let mut last_file = String::new();
@@ -2924,56 +3161,39 @@ impl IndexPipeline {
                 return Err(PipelineAbort::Cancelled.into());
             }
 
-            // Outer: get next batch of distinct from_file values after the cursor.
-            #[derive(Deserialize)]
-            struct FileRow {
-                from_file: String,
-            }
-            let t_outer = Instant::now();
-            let file_batch: Vec<FileRow> = db
+            let t_scan = Instant::now();
+            let mut batch: Vec<RawEdgeRow> = db
                 .query(
-                    "SELECT from_file FROM raw_edge \
+                    "SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path \
+                     FROM raw_edge \
                      WHERE from_file > $cursor \
-                     GROUP BY from_file \
                      ORDER BY from_file \
-                     LIMIT $batch",
+                     LIMIT $page",
                 )
                 .bind(("cursor", last_file.clone()))
-                .bind(("batch", FILE_BATCH_SIZE))
+                .bind(("page", RAW_EDGE_SCAN_PAGE))
                 .await
-                .context("phase2: get next file batch")?
+                .context("phase2: scan raw_edge page")?
                 .take(0)?;
-            scan_ms_total += t_outer.elapsed().as_millis() as u64;
-
-            if file_batch.is_empty() {
+            let Some(page_last) = batch.last().map(|r| r.from_file.clone()) else {
                 break;
+            };
+            if batch.len() as i64 == RAW_EDGE_SCAN_PAGE {
+                batch.retain(|r| r.from_file != page_last);
+                let whole: Vec<RawEdgeRow> = db
+                    .query(
+                        "SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path \
+                         FROM raw_edge \
+                         WHERE from_file = $file",
+                    )
+                    .bind(("file", page_last.clone()))
+                    .await
+                    .context("phase2: read page-boundary file")?
+                    .take(0)?;
+                batch.extend(whole);
             }
-
-            // Advance outer cursor to the last file in this batch.
-            if let Some(last) = file_batch.last() {
-                last_file = last.from_file.clone();
-            }
-
-            // Inner: for each file, fetch all its raw_edge rows and resolve them.
-            // No ORDER BY needed — we just need all rows for this file.
-            let files_in_batch: Vec<String> = file_batch.into_iter().map(|r| r.from_file).collect();
-            let t_inner = Instant::now();
-            let batch: Vec<RawEdgeRow> = db
-                .query(
-                    "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, from_fqn, to_name, kind, line, import_path \
-                     FROM raw_edge \
-                     WHERE from_file IN $files",
-                )
-                .bind(("files", files_in_batch))
-                .await
-                .context("phase2: scan raw_edge for file batch")?
-                .take(0)?;
-            scan_ms_total += t_inner.elapsed().as_millis() as u64;
-
-            if batch.is_empty() {
-                continue;
-            }
+            last_file = page_last;
+            scan_ms_total += t_scan.elapsed().as_millis() as u64;
 
             pages_processed += 1;
             raw_edges_scanned += batch.len() as u64;
@@ -3001,11 +3221,6 @@ impl IndexPipeline {
                 p2.relate_write_ms += t_write.elapsed().as_millis() as u64;
                 edge_batch.clear();
             }
-
-            // If the outer batch was smaller than FILE_BATCH_SIZE, we've exhausted
-            // all files — no need for another outer query.
-            // (The outer loop will break because file_batch.is_empty() on next iter,
-            //  but we can also break early here for clarity.)
         }
 
         p2.resolve_cpu_ms = resolve_ms_total;
@@ -3346,14 +3561,18 @@ impl IndexPipeline {
     ///      those would never be re-resolved (their from_file is not in resolve_set,
     ///      and at repo scale their `raw_edge` rows aren't even persisted). So the
     ///      in_file-only delete is both correct AND the lever that bounds the cost.
-    ///   3. Re-resolve raw_edge rows WHERE from_file IN resolve_set via keyset
-    ///      pagination (uses idx_raw_edge_from_file).
+    ///   3. Re-resolve raw_edge rows of resolve_set, one file batch per read
+    ///      (`from_file IN $batch`, idx_raw_edge_from_file); every row read once.
+    ///
+    /// A resolve set covering a large share of the repo is handed to the full
+    /// Phase 2 instead (see [`exceeds_incremental_phase2_budget`]).
     ///
     /// The `edges_resolved` crash-recovery marker is NOT written here — it is only
     /// meaningful for a full rebuild where ALL raw_edge must be re-resolved on crash
     /// recovery. Incremental is already idempotent: if it crashes before file_meta
     /// is written (the crash-safe anchor in streaming_index), the whole incremental
     /// re-runs on next trigger, including this method.
+    #[cfg(test)]
     async fn resolve_edges_incremental(
         &self,
         db: &Surreal<Db>,
@@ -3361,24 +3580,96 @@ impl IndexPipeline {
         dir1_callers: &[String],
         added_names: &[String],
     ) -> Result<Phase2IncrStats> {
-        use serde::Deserialize;
+        self.resolve_edges_incremental_with(
+            db,
+            changed_files,
+            dir1_callers,
+            added_names,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
 
+    /// [`resolve_edges_incremental`](Self::resolve_edges_incremental) with the
+    /// run's context: `indexed_files` enables the full-Phase-2 fallback for an
+    /// oversized blast radius, and `cancel_token` is honored between batches. A
+    /// cancel leaves `edges_resolved` unset (the caller stamps it only on Ok), so
+    /// the next run replays Phase 2 from the durable raw_edge table.
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_edges_incremental_with(
+        &self,
+        db: &Surreal<Db>,
+        changed_files: &[String],
+        dir1_callers: &[String],
+        added_names: &[String],
+        indexed_files: Option<usize>,
+        progress: Option<&ProgressHandle>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<Phase2IncrStats> {
         let mut stats = Phase2IncrStats::default();
 
         if changed_files.is_empty() {
             return Ok(stats);
         }
 
-        // Step 1: Build resolve_set = changed_files ∪ dir1_callers (deduped).
-        //
+        let resolve_set = self
+            .build_resolve_set(db, changed_files, dir1_callers, added_names, &mut stats)
+            .await?;
+        debug!(
+            repo = %self.repo,
+            changed = changed_files.len(),
+            resolve_set = resolve_set.len(),
+            "incremental phase2: resolve_set built"
+        );
+        stats.resolve_set_size = resolve_set.len() as u64;
+
+        if let Some(indexed) = indexed_files
+            && exceeds_incremental_phase2_budget(resolve_set.len(), indexed)
+        {
+            info!(
+                repo = %self.repo,
+                resolve_set = resolve_set.len(),
+                indexed,
+                "incremental phase2: blast radius too large — replaying full Phase 2"
+            );
+            let reresolve_start = Instant::now();
+            self.resolve_edges_phase2(db, progress, cancel_token)
+                .await
+                .context("incremental phase2: full fallback")?;
+            stats.p2_reresolve_ms = reresolve_start.elapsed().as_millis() as u64;
+            stats.full_fallback = true;
+            return Ok(stats);
+        }
+
+        self.reresolve_files(db, &resolve_set, cancel_token, &mut stats)
+            .await?;
+        info!(repo = %self.repo, resolve_set = resolve_set.len(), "incremental Phase 2 edge resolution complete");
+        Ok(stats)
+    }
+
+    /// Step 1: resolve_set = changed ∪ dir1_callers ∪ callers of `added_names`.
+    async fn build_resolve_set(
+        &self,
+        db: &Surreal<Db>,
+        changed_files: &[String],
+        dir1_callers: &[String],
+        added_names: &[String],
+        stats: &mut Phase2IncrStats,
+    ) -> Result<Vec<String>> {
+        use serde::Deserialize;
+
         // dir1_callers was computed by incremental_run as the callers pointing into
         // SURFACE-CHANGED (or deleted) files — the "removal/identity direction". A
         // surface-unchanged changed file contributes no dir1 callers, so its
-        // thousands of incoming edges stay out of the resolve_set.
-        let mut resolve_set: Vec<String> = changed_files.to_vec();
-        for caller in dir1_callers {
-            if !resolve_set.contains(caller) {
-                resolve_set.push(caller.clone());
+        // thousands of incoming edges stay out of the resolve_set. Deduped through a
+        // set: a Vec `contains` here was quadratic in a large name expansion.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut resolve_set: Vec<String> = Vec::new();
+        for file in changed_files.iter().chain(dir1_callers) {
+            if seen.insert(file.clone()) {
+                resolve_set.push(file.clone());
             }
         }
 
@@ -3389,44 +3680,66 @@ impl IndexPipeline {
         // that were unchanged are NOT in added_names and are not expanded — this is
         // the narrowing that keeps a comment edit's resolve_set == changed_files.
         //
-        // NOTE: `p2_symname_ms` is no longer measured here — the symbol-surface
-        // load+diff that produces `added_names` now happens once in incremental_run
-        // (its time is reported as the surface-delta stage), so this method just
-        // consumes the precomputed result.
+        // raw_edge.to_name stores the unresolved leaf callee name, so this finds any
+        // file that calls a symbol with the given leaf name — including files whose
+        // existing calls row points to a different definition (stale lex-first
+        // target). One `to_name = $n` equality per name is a point seek on
+        // idx_raw_edge_to_name (v8); the old `to_name IN $names` with no index
+        // full-scanned raw_edge on every incremental run.
         if !added_names.is_empty() {
-            // Find callers that target any added name via raw_edge.to_name.
-            // raw_edge.to_name stores the unresolved leaf callee name, so this correctly
-            // finds any file that calls a symbol with the given leaf name — including files
-            // whose existing calls row points to a different definition (stale lex-first target).
-            // Uses idx_raw_edge_from_file for the GROUP BY; the to_name lookup is bounded
-            // by the number of edges with matching callee names.
             #[derive(Deserialize)]
             struct FromFileRow {
                 from_file: String,
             }
             let dir2_start = Instant::now();
-            let name_exp_rows: Vec<FromFileRow> = db
-                .query("SELECT from_file FROM raw_edge WHERE to_name IN $names GROUP BY from_file")
-                .bind(("names", added_names.to_vec()))
-                .await
-                .context("incremental phase2: name-based expansion via raw_edge")?
-                .take(0)?;
-            stats.p2_dir2_scan_ms = dir2_start.elapsed().as_millis() as u64;
-
-            for row in name_exp_rows {
-                if !resolve_set.contains(&row.from_file) {
-                    resolve_set.push(row.from_file);
+            for names in added_names.chunks(NAME_EXPANSION_BATCH) {
+                let mut stmt = String::new();
+                for i in 0..names.len() {
+                    stmt.push_str(&format!(
+                        "SELECT from_file FROM raw_edge WHERE to_name = $n{i} GROUP BY from_file;\n"
+                    ));
+                }
+                let mut q = db.query(&stmt);
+                for (i, name) in names.iter().enumerate() {
+                    q = q.bind((format!("n{i}"), name.clone()));
+                }
+                let mut resp = q
+                    .await
+                    .context("incremental phase2: name-based expansion via raw_edge")?;
+                for i in 0..names.len() {
+                    let rows: Vec<FromFileRow> = resp
+                        .take(i)
+                        .context("incremental phase2: decode name expansion")?;
+                    for row in rows {
+                        if seen.insert(row.from_file.clone()) {
+                            resolve_set.push(row.from_file);
+                        }
+                    }
                 }
             }
+            stats.p2_dir2_scan_ms = dir2_start.elapsed().as_millis() as u64;
         }
+        Ok(resolve_set)
+    }
 
-        debug!(
-            repo = %self.repo,
-            changed = changed_files.len(),
-            resolve_set = resolve_set.len(),
-            "incremental phase2: resolve_set built"
-        );
-        stats.resolve_set_size = resolve_set.len() as u64;
+    /// Steps 2–3: delete the resolve set's OUTGOING calls, then re-resolve its
+    /// raw edges. O(resolve_set files + their edges) — never O(repo).
+    async fn reresolve_files(
+        &self,
+        db: &Surreal<Db>,
+        resolve_set: &[String],
+        cancel_token: Option<&CancellationToken>,
+        stats: &mut Phase2IncrStats,
+    ) -> Result<()> {
+        let check_cancel = || -> Result<()> {
+            if let Some(ct) = cancel_token
+                && ct.is_cancelled()
+            {
+                info!(repo = %self.repo, "incremental phase2: cancelled");
+                return Err(PipelineAbort::Cancelled.into());
+            }
+            Ok(())
+        };
 
         // Step 2: Delete only the OUTGOING calls rows of resolve_set files.
         //
@@ -3456,6 +3769,7 @@ impl IndexPipeline {
         // (no injection, no per-row re-parse of the path string).
         let delete_calls_start = Instant::now();
         for chunk in resolve_set.chunks(CALLS_DELETE_TXN_CHUNK) {
+            check_cancel()?;
             let mut stmt = String::from("BEGIN;\n");
             for i in 0..chunk.len() {
                 stmt.push_str(&format!("DELETE FROM calls WHERE in_file = $p{i};\n"));
@@ -3472,43 +3786,30 @@ impl IndexPipeline {
         }
         stats.p2_delete_calls_ms = delete_calls_start.elapsed().as_millis() as u64;
 
-        // Step 3: Re-resolve raw_edge rows whose from_file is in the resolve set.
-        // Keyset-paginated with from_file filter — uses idx_raw_edge_from_file.
-
+        // Step 3: Re-resolve the raw_edge rows of the resolve set, one file batch
+        // per read — the full pass's inner `from_file IN $files` shape. The old
+        // `type::string(id) > $cursor ORDER BY id_str` keyset re-read and re-sorted
+        // every resolve-set edge for each 512-row page (O(pages × edges)): ~7 min
+        // of Phase 2 for a 23-file C++ change. No ordering is needed — each edge
+        // resolves independently — so every row is now read exactly once.
+        // Resolution keeps its 512-row granularity so each symbol name lookup has
+        // the same bounded `name IN` list as before.
         let reresolve_start = Instant::now();
-        let page_size: i64 = WRITE_BATCH_SIZE as i64;
-        let mut cursor = String::new();
         let mut edge_batch: Vec<(String, String, i64, String, String, String, String)> = Vec::new();
-
-        loop {
-            let batch: Vec<RawEdgeRow> = db
+        for files in resolve_set.chunks(INCREMENTAL_PHASE2_FILE_BATCH) {
+            check_cancel()?;
+            let rows: Vec<RawEdgeRow> = db
                 .query(
-                    "SELECT type::string(id) AS id_str, \
-                            from_file, from_name, from_fqn, to_name, kind, line, import_path \
+                    "SELECT from_file, from_name, from_fqn, to_name, kind, line, import_path \
                      FROM raw_edge \
-                     WHERE from_file IN $files \
-                       AND type::string(id) > $cursor \
-                     ORDER BY id_str \
-                     LIMIT $page",
+                     WHERE from_file IN $files",
                 )
-                .bind(("files", resolve_set.clone()))
-                .bind(("cursor", cursor.clone()))
-                .bind(("page", page_size))
+                .bind(("files", files.to_vec()))
                 .await
-                .context("incremental phase2: scan raw_edge page")?
+                .context("incremental phase2: read raw_edge for file batch")?
                 .take(0)?;
-
-            if batch.is_empty() {
-                break;
-            }
-
-            cursor = batch.last().map(|r| r.id_str.clone()).unwrap_or(cursor);
-
-            resolve_raw_edge_page(db, &batch, &mut edge_batch, "incremental phase2").await?;
-
-            let batch_len = batch.len() as i64;
-            if batch_len < page_size {
-                break;
+            for page in rows.chunks(WRITE_BATCH_SIZE) {
+                resolve_raw_edge_page(db, page, &mut edge_batch, "incremental phase2").await?;
             }
         }
 
@@ -3519,9 +3820,7 @@ impl IndexPipeline {
                 .context("incremental phase2: flush tail edge batch")?;
         }
         stats.p2_reresolve_ms = reresolve_start.elapsed().as_millis() as u64;
-
-        info!(repo = %self.repo, resolve_set = resolve_set.len(), "incremental Phase 2 edge resolution complete");
-        Ok(stats)
+        Ok(())
     }
 }
 
@@ -4499,6 +4798,37 @@ pub(crate) fn filter_hidden_changes_with(
             }
             // Drop Added/Modified unless the path passes the full walk_repo rule set.
             filter.allows(std::path::Path::new(&c.path))
+        })
+        .collect()
+}
+
+/// True for the files whose edit can change which paths are indexable.
+fn is_ignore_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| matches!(n, ".gitignore" | ".ignore" | ".augmentignore"))
+}
+
+/// A `Deleted` change for every stored path the current rule set excludes.
+///
+/// O(stored + directories × depth): one filter for the whole set, so each
+/// directory's ignore files are read once, and no per-file `stat` (stored paths
+/// are files by construction).
+pub(crate) fn now_ignored_deletions(
+    repo: &std::path::Path,
+    stored_paths: &HashSet<String>,
+    extra_extensions: Vec<String>,
+    ignore_filenames: HashSet<String>,
+    ignore_paths: HashSet<String>,
+) -> Vec<FileChange> {
+    let filter = ChangeFilter::new_complete(repo, extra_extensions, ignore_filenames, ignore_paths);
+    stored_paths
+        .iter()
+        .filter(|p| !filter.allows_as(std::path::Path::new(p.as_str()), false))
+        .map(|p| FileChange {
+            path: p.clone(),
+            kind: ChangeKind::Deleted,
         })
         .collect()
 }
@@ -8285,7 +8615,8 @@ mod mmap_warm_microbench {
 
         // (b) Persist the shard to disk (this is what the slow-path warm does once).
         let t_persist = Instant::now();
-        shard_file::write_new_generation(tmp.path(), repo, &ram, n as u64).unwrap();
+        shard_file::write_new_generation(tmp.path(), repo, &ram, n as u64, "test-identity")
+            .unwrap();
         let persist_ms = t_persist.elapsed().as_millis();
 
         // Drop the in-RAM shard so the OS page cache for this file is the only

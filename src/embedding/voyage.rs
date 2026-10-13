@@ -121,6 +121,46 @@ impl VoyageClient {
         })
     }
 
+    /// [`new_for_provider`](Self::new_for_provider), but reusing one process-wide
+    /// client while the embedding settings are unchanged. Query paths used to build
+    /// a client per request: a new connection pool, so a new TCP+TLS handshake per
+    /// query and one socket left in TIME_WAIT each — at agent query rates that
+    /// exhausted Windows' 16K ephemeral ports and failed queries outright. Bounded
+    /// to a few entries (normally one live config); a settings change adds a new
+    /// entry and the oldest falls out.
+    pub fn shared_for_provider(
+        provider: Provider,
+        model: String,
+        api_keys: Vec<String>,
+        base_url: Option<&str>,
+        dimensions: Option<u32>,
+    ) -> Result<Self> {
+        type Key = (Provider, String, Vec<String>, Option<String>, Option<u32>);
+        const MAX_SHARED: usize = 4;
+        static SHARED: std::sync::Mutex<Vec<(Key, VoyageClient)>> =
+            std::sync::Mutex::new(Vec::new());
+        let key: Key = (
+            provider,
+            model,
+            api_keys,
+            base_url.map(str::to_owned),
+            dimensions,
+        );
+        let mut shared = SHARED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, client)) = shared.iter().find(|(cached, _)| *cached == key) {
+            return Ok(client.clone());
+        }
+        let client =
+            Self::new_for_provider(key.0, key.1.clone(), key.2.clone(), key.3.as_deref(), key.4)?;
+        if shared.len() >= MAX_SHARED {
+            shared.remove(0);
+        }
+        shared.push((key, client.clone()));
+        Ok(client)
+    }
+
     pub fn provider(&self) -> Provider {
         self.inner.provider
     }

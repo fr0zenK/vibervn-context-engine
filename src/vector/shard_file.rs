@@ -81,6 +81,26 @@ fn write_current_gen(root: &Path, generation: u64) -> Result<()> {
     Ok(())
 }
 
+/// A generation number no existing generation dir (nor CURRENT) uses.
+///
+/// Deriving it from CURRENT alone restarted at 0 whenever an index run had
+/// invalidated CURRENT, so the next warm rewrote `0/shard.f32` — a file an older
+/// reader may still have mapped (a sharing violation on win32) — and a run's
+/// `pre_publish_generation` rollback fence could match a newer warm's reused
+/// number. Scans only this repo's root, which reaping keeps to a few dirs.
+fn next_generation(root: &Path) -> u64 {
+    let newest_dir = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok())
+        .max();
+    newest_dir
+        .max(read_current_gen(root))
+        .map(|g| g + 1)
+        .unwrap_or(0)
+}
+
 /// Serialize a built in-RAM shard to a NEW generation dir and flip CURRENT to it.
 /// Returns the new generation number. Never overwrites a file an existing reader
 /// may have mapped (win32-safe): the new generation dir is fresh.
@@ -92,9 +112,10 @@ pub fn write_new_generation(
     repo: &str,
     index: &VectorIndex,
     content_stamp: u64,
+    identity: &str,
 ) -> Result<u64> {
     let root = repo_shard_root(data_dir, repo);
-    let next = read_current_gen(&root).map(|g| g + 1).unwrap_or(0);
+    let next = next_generation(&root);
     let generation_dir = root.join(next.to_string());
     std::fs::create_dir_all(&generation_dir)
         .with_context(|| format!("create generation dir {generation_dir:?}"))?;
@@ -142,6 +163,12 @@ pub fn write_new_generation(
     }
     std::fs::rename(&ids_tmp, generation_dir.join("shard.ids")).context("rename shard.ids")?;
 
+    // ── identity : the embedding space of these vectors ─────────────────────
+    // The content stamp already mixes the identity in, but cannot be inverted.
+    // `open_current_stale` serves this file while an index run has made its stamp
+    // obsolete, and must still refuse vectors from another embedding space.
+    std::fs::write(generation_dir.join(IDENTITY_FILE), identity).context("write identity")?;
+
     // Flip CURRENT to the new generation — readers see the new shard from here on; any
     // in-flight reader of the old generation keeps its mapping (old files untouched).
     write_current_gen(&root, next)?;
@@ -157,6 +184,39 @@ pub fn open_current(
     repo: &str,
     expected_dim: usize,
     expected_stamp: u64,
+) -> Result<Option<(VectorIndex, u64)>> {
+    open_current_checked(data_dir, repo, expected_dim, Some(expected_stamp))
+}
+
+/// Open the CURRENT shard regardless of its content stamp, as long as it was
+/// written for `identity` — the search-only stale snapshot served while an index
+/// run has the repo's live vectors fenced (the stamp is obsolete from the run's
+/// first epoch bump). Files written before the identity sidecar existed are not
+/// served. Ok(None) when there is no usable file.
+pub fn open_current_stale(
+    data_dir: &Path,
+    repo: &str,
+    identity: &str,
+) -> Result<Option<VectorIndex>> {
+    let root = repo_shard_root(data_dir, repo);
+    let Some(generation) = read_current_gen(&root) else {
+        return Ok(None);
+    };
+    let stored = std::fs::read_to_string(root.join(generation.to_string()).join(IDENTITY_FILE));
+    if stored.ok().as_deref() != Some(identity) {
+        return Ok(None);
+    }
+    Ok(open_current_checked(data_dir, repo, 0, None)?.map(|(index, _)| index))
+}
+
+/// Embedding-identity sidecar inside a generation dir.
+const IDENTITY_FILE: &str = "identity";
+
+fn open_current_checked(
+    data_dir: &Path,
+    repo: &str,
+    expected_dim: usize,
+    expected_stamp: Option<u64>,
 ) -> Result<Option<(VectorIndex, u64)>> {
     let root = repo_shard_root(data_dir, repo);
     let Some(generation) = read_current_gen(&root) else {
@@ -198,7 +258,7 @@ pub fn open_current(
     if map.len() != expect_bytes {
         return Ok(None);
     }
-    if stamp != expected_stamp {
+    if expected_stamp.is_some_and(|expected| stamp != expected) {
         return Ok(None); // stale — index changed since this file was built
     }
     // Alignment: the f32 region starts at HEADER_BYTES (64, multiple of 4) and the
@@ -301,6 +361,24 @@ mod tests {
         vi
     }
 
+    /// REGRESSION: after an index run invalidated CURRENT, the next warm restarted
+    /// at generation 0 and rewrote a generation dir an old reader may still map.
+    #[test]
+    fn invalidated_current_never_reuses_a_generation() {
+        let tmp = TempDir::new().unwrap();
+        let idx = build_index(4, 8);
+        let g0 = write_new_generation(tmp.path(), "/r", &idx, 1, "test-identity").unwrap();
+        let g1 = write_new_generation(tmp.path(), "/r", &idx, 1, "test-identity").unwrap();
+        assert!(invalidate_current_if_generation(tmp.path(), "/r", Some(g1)));
+
+        let g2 = write_new_generation(tmp.path(), "/r", &idx, 1, "test-identity").unwrap();
+        assert!(g2 > g1 && g1 > g0, "got {g0}, {g1}, {g2}");
+        assert!(
+            !invalidate_current_if_generation(tmp.path(), "/r", Some(g1)),
+            "a rollback fenced on the old generation must not drop the newer one"
+        );
+    }
+
     /// Round-trip: write → mmap-open → search returns BIT-IDENTICAL results to the
     /// in-RAM shard (exactness, no precision loss).
     #[test]
@@ -308,7 +386,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = "/proj/round";
         let ram = build_index(200, 64);
-        let g = write_new_generation(tmp.path(), repo, &ram, 200).unwrap();
+        let g = write_new_generation(tmp.path(), repo, &ram, 200, "test-identity").unwrap();
         assert_eq!(g, 0);
 
         let (mapped, gen_read) = open_current(tmp.path(), repo, 64, 200)
@@ -354,7 +432,7 @@ mod tests {
             })
             .collect();
         ram.insert(&rows);
-        write_new_generation(tmp.path(), repo, &ram, 5).unwrap();
+        write_new_generation(tmp.path(), repo, &ram, 5, "test-identity").unwrap();
         let (mapped, _) = open_current(tmp.path(), repo, 4, 5).unwrap().unwrap();
         assert!(mapped.is_mmap());
 
@@ -383,7 +461,7 @@ mod tests {
         let ram_bytes = ram.byte_size();
         let payload = 100 * 64 * std::mem::size_of::<f32>();
         assert!(ram_bytes >= payload, "in-RAM shard counts the f32 payload");
-        write_new_generation(tmp.path(), repo, &ram, 100).unwrap();
+        write_new_generation(tmp.path(), repo, &ram, 100, "test-identity").unwrap();
         let (mapped, _) = open_current(tmp.path(), repo, 64, 100).unwrap().unwrap();
         let map_bytes = mapped.byte_size();
         assert!(
@@ -403,7 +481,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = "/proj/stale";
         let ram = build_index(50, 64);
-        write_new_generation(tmp.path(), repo, &ram, 50).unwrap(); // built at stamp=50
+        write_new_generation(tmp.path(), repo, &ram, 50, "test-identity").unwrap(); // built at stamp=50
         // Index now reports a different chunk count (stamp=51) → file is stale.
         assert!(open_current(tmp.path(), repo, 64, 51).unwrap().is_none());
         // Same stamp still opens.
@@ -416,7 +494,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = "/proj/dim";
         let ram = build_index(50, 64);
-        write_new_generation(tmp.path(), repo, &ram, 50).unwrap();
+        write_new_generation(tmp.path(), repo, &ram, 50, "test-identity").unwrap();
         assert!(
             open_current(tmp.path(), repo, 128, 50).unwrap().is_none(),
             "wrong dim rejected"
@@ -433,7 +511,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = "/proj/corrupt";
         let ram = build_index(50, 64);
-        write_new_generation(tmp.path(), repo, &ram, 50).unwrap();
+        write_new_generation(tmp.path(), repo, &ram, 50, "test-identity").unwrap();
         // Truncate shard.f32 to half its bytes.
         let root = repo_shard_root(tmp.path(), repo);
         let cur = read_current_gen(&root).unwrap();
@@ -457,7 +535,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = "/proj/edit";
         let ram = build_index(100, 64);
-        write_new_generation(tmp.path(), repo, &ram, 100).unwrap();
+        write_new_generation(tmp.path(), repo, &ram, 100, "test-identity").unwrap();
         let (mut mapped, _) = open_current(tmp.path(), repo, 64, 100).unwrap().unwrap();
         assert!(mapped.is_mmap(), "starts mmap-backed");
         let before = mapped.len();
@@ -501,11 +579,13 @@ mod tests {
     fn new_generation_preserves_old_gen_files() {
         let tmp = TempDir::new().unwrap();
         let repo = "/proj/gen";
-        let g0 = write_new_generation(tmp.path(), repo, &build_index(30, 64), 30).unwrap();
+        let g0 = write_new_generation(tmp.path(), repo, &build_index(30, 64), 30, "test-identity")
+            .unwrap();
         // Open + hold the gen-0 mmap (simulates an in-flight reader).
         let (held, _) = open_current(tmp.path(), repo, 64, 30).unwrap().unwrap();
         // Write a new generation (a "full rebuild").
-        let g1 = write_new_generation(tmp.path(), repo, &build_index(40, 64), 40).unwrap();
+        let g1 = write_new_generation(tmp.path(), repo, &build_index(40, 64), 40, "test-identity")
+            .unwrap();
         assert_eq!(g1, g0 + 1, "gen advances");
         let root = repo_shard_root(tmp.path(), repo);
         // CURRENT now points at g1; gen-0's files still exist (held mapping valid).

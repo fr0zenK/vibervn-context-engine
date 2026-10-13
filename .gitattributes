@@ -1,0 +1,4 @@
+# Prompt templates are embedded verbatim with include_str!: a CRLF checkout
+# (core.autocrlf=true on Windows) would ship carriage returns inside MCP and
+# LLM output.
+src/prompts/*.txt text eol=lf

@@ -30,7 +30,8 @@ use crate::embedding::voyage::{Provider, VoyageClient};
 use sha2::{Digest, Sha256};
 
 /// `index_meta` key under which a repo's committed embedding identity is stored.
-/// Written only after a full index run's data (chunks + edges) is durable.
+/// Written once a run's chunks, vectors and file_meta are durable — BEFORE the
+/// call-graph phase, whose completion `edges_resolved` tracks separately.
 pub const EMBEDDING_IDENTITY_KEY: &str = "embedding_identity";
 
 /// Describes the embedding vector space: `(provider, model, dimensions)`.

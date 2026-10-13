@@ -46,6 +46,9 @@ pub const RERANK_AGENTIC_TOOL_READ: &str = include_str!("rerank_agentic_tool_rea
 pub const MCP_DEGRADE_INDEX_FAILED: &str = include_str!("mcp_degrade_index_failed.txt");
 pub const MCP_DEGRADE_INDEXING: &str = include_str!("mcp_degrade_indexing.txt");
 pub const MCP_GRAPH_PENDING: &str = include_str!("mcp_graph_pending.txt");
+/// Prepended while an index run has the live index fenced and the answer comes
+/// from the previous (recent) index snapshot. See `mcp::readiness::ServeStale`.
+pub const MCP_STALE_RESULTS: &str = include_str!("mcp_stale_results.txt");
 pub const MCP_FILE_RETRIEVAL_HINT: &str = include_str!("mcp_file_retrieval_hint.txt");
 /// Prepended to results served from the OTHER scope after the requested one came
 /// back empty (`{{requested}}`, `{{served}}`). See `query::scope_fallback`.
@@ -105,6 +108,28 @@ mod tests {
         assert_eq!(render(t, &[("a", "X")]), "X and X again");
     }
 
+    /// Every `.txt` here is embedded verbatim. A CRLF checkout (autocrlf on
+    /// Windows) shipped carriage returns into MCP output; `.gitattributes` pins
+    /// these files to LF and this keeps it that way. Scans the directory, so a new
+    /// template is covered without registering it.
+    #[test]
+    fn prompt_templates_have_no_carriage_returns() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/prompts");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "txt") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(!text.contains('\r'), "CRLF in {}", path.display());
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 20,
+            "expected the prompt templates, found {checked}"
+        );
+    }
+
     #[test]
     fn embedded_prompts_are_non_empty() {
         // Guard against an empty/missing .txt slipping in via include_str!.
@@ -115,6 +140,7 @@ mod tests {
             RERANK_SYSTEM_STRUCTURED,
             RERANK_AGENTIC_SYSTEM,
             MCP_DEGRADE_INDEXING,
+            MCP_STALE_RESULTS,
             MCP_SCOPE_FALLBACK,
             MCP_GREP_HINT,
             MCP_SCOPE_PARAM,

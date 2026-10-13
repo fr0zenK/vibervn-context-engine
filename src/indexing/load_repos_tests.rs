@@ -343,6 +343,66 @@ async fn vector_search_signals_warming_when_shard_not_resident() {
     );
 }
 
+/// REGRESSION: the call-graph fast path queried with a ZERO warm budget and the
+/// warm ran INSIDE that timeout, so it was cancelled at its first DB await on
+/// every query: a cold shard never loaded and every retry said "still warming"
+/// for the whole Phase 2. The warm now outlives the query's bounded wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_budget_queries_still_complete_the_warm() {
+    let home = TempDir::new().expect("tempdir");
+    let repo = "/proj/zero_budget".to_string();
+    let repo_dbs: RepoDbMap = Arc::new(RwLock::new(HashMap::new()));
+    seed_repo(&repo_dbs, home.path(), &repo, 3).await;
+    let settings = crate::config::Settings {
+        repos: vec![repo.clone()],
+        ..Default::default()
+    };
+    let settings_handle = Arc::new(RwLock::new(settings.clone()));
+    let engine = IndexEngine::start(
+        home.path().to_path_buf(),
+        home.path().join("embeddings"),
+        &settings,
+        repo_dbs.clone(),
+        settings_handle,
+        false,
+    )
+    .await;
+
+    // Hold the warm lock so the warm is guaranteed to be parked at an await when
+    // the zero budget expires (a tiny test DB could otherwise finish in one poll).
+    let warm_lock = engine.get_warm_lock(&repo).await;
+    let held = warm_lock.lock().await;
+
+    let q = vec![1.0f32, 0.0, 0.0, 0.0];
+    let identity = test_identity();
+    let first = engine
+        .vector_search(&q, 10, Some(&repo), std::time::Duration::ZERO, &identity)
+        .await;
+    assert!(first.warming, "the shard cannot be resident yet");
+    drop(held);
+
+    // No further queries: only the warm the first query started can load it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine
+        .vector_index
+        .read()
+        .await
+        .resident_identity(&repo)
+        .is_none()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the warm started by a zero-budget query must complete on its own"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let outcome = engine
+        .vector_search(&q, 10, Some(&repo), std::time::Duration::ZERO, &identity)
+        .await;
+    assert!(!outcome.warming);
+    assert_eq!(outcome.results.len(), 3, "the warmed shard is complete");
+}
+
 /// Multi-repo (`repo_filter=None`) search must fail closed per shard identity:
 /// matching shards contribute results, mismatched shards contribute NOTHING,
 /// are identity-fenced evicted, and are background-warmed for repair.

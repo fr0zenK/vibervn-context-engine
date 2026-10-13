@@ -96,7 +96,9 @@ pub(crate) fn rest_gate(readiness: IndexReadiness) -> RestGate {
             warm_budget,
             graph_pending: false,
         },
-        IndexReadiness::ReadyVectorOnly { warm_budget } => RestGate::Query {
+        // A stale snapshot answers vector-only too: `calls` may be mid-rewrite.
+        IndexReadiness::ReadyVectorOnly { warm_budget }
+        | IndexReadiness::ReadyStale { warm_budget } => RestGate::Query {
             graph_mode: QueryGraphMode::VectorOnly,
             warm_budget,
             graph_pending: true,

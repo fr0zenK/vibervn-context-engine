@@ -317,6 +317,10 @@ pub struct IndexTrigger {
 pub enum WarmResult {
     Installed(usize),
     IdentityMismatch,
+    /// Vectors are stored but the identity marker is absent (an interrupted run
+    /// of an older build). Unknown is not wrong: an ordinary run proves or
+    /// refutes the space (`IndexPipeline::run`), no rebuild is forced from here.
+    IdentityUnknown,
     MutationInProgress,
 }
 
@@ -343,7 +347,16 @@ pub(crate) async fn warm_repo_shard(
     // repo_dbs). Every install below requires it unchanged: an update that begins
     // and publishes while the scan runs leaves `is_mutating` false again, so only
     // the epoch reveals that this snapshot predates it.
-    let scan_epoch = vector_index.read().await.mutation_epoch(repo);
+    let (scan_epoch, mutating) = {
+        let vi = vector_index.read().await;
+        (vi.mutation_epoch(repo), vi.is_mutating(repo))
+    };
+    // Inside an index run's destructive window nothing could be installed anyway.
+    // Bail before the O(repo) scan: warms are detached (they outlive the query
+    // that started them), so a doomed scan would only burn I/O against the run.
+    if mutating {
+        return Ok(WarmResult::MutationInProgress);
+    }
 
     let db = store::get_or_open(repo_dbs, data_dir, repo, generation).await?;
 
@@ -357,6 +370,10 @@ pub(crate) async fn warm_repo_shard(
 
     let current_key = current.as_key_string();
     let stored_key = crate::store::ops::get_meta(&db, EMBEDDING_IDENTITY_KEY).await?;
+    if stored_key.is_none() {
+        info!(repo = %repo, "warm: embedding identity marker absent; queueing a run to verify it");
+        return Ok(WarmResult::IdentityUnknown);
+    }
     if stored_key.as_deref() != Some(current_key.as_str()) {
         // Durable marker is a cross-restart safety net. Correctness does not depend
         // on this write succeeding: warm_repo_blocking also queues rebuild:true.
@@ -419,7 +436,11 @@ pub(crate) async fn warm_repo_shard(
         }
     }
     let persisted = match crate::vector::shard_file::write_new_generation(
-        data_dir, repo, &shard, stamp,
+        data_dir,
+        repo,
+        &shard,
+        stamp,
+        &current_key,
     ) {
         Ok(g) => Some(g),
         Err(e) => {
@@ -920,7 +941,8 @@ impl IndexEngine {
     ///   repo is always required): if the repo's shard is not resident, BLOCK on a
     ///   single-flight warm (bounded by `warm_wait`) so the FIRST query to a repo
     ///   this session returns complete results, then search the now-resident shard.
-    ///   On warm timeout, fall through and return whatever is resident (partial).
+    ///   On warm timeout, fall through and return whatever is resident (partial);
+    ///   the warm itself keeps running detached so a retry finds the shard.
     /// - `repo_filter = None`: search every resident shard and background-warm any
     ///   cold in-scope repo (non-blocking, partial results). Retained for safety;
     ///   the query handlers reject repo-less queries before reaching here.
@@ -992,26 +1014,51 @@ impl IndexEngine {
                 ScopedSearch::Cold => {}
             }
 
+            // A repo mid-update has no live shard to warm (warm refuses to install
+            // inside the fence): answer from its last published snapshot instead.
+            // Readiness only lets a query get here while that index is recent.
+            if self.vector_index.read().await.is_mutating(repo) {
+                return self
+                    .search_stale(query_embedding, top_k, repo, &identity_key, class)
+                    .await;
+            }
+
             // The ONLY warm path. Pass the query client's exact identity snapshot;
             // warm never re-derives it from mutable settings.
-            let _ = tokio::time::timeout(
-                warm_wait,
-                self.warm_repo_blocking(repo.to_string(), current.clone()),
-            )
-            .await;
+            //
+            // The WAIT is bounded, the warm is not: it runs as its own task, so
+            // when `warm_wait` expires only this query stops waiting (dropping a
+            // JoinHandle detaches the task) and the load completes for the retry.
+            // Timing out the warm future itself cancelled the load at its first DB
+            // await — with the zero budget of the call-graph fast path no warm ever
+            // finished, and every retry answered "still warming".
+            let warm = {
+                let engine = Arc::clone(self);
+                let repo = repo.to_string();
+                let identity = current.clone();
+                tokio::spawn(async move { engine.warm_repo_blocking(repo, identity).await })
+            };
+            let _ = tokio::time::timeout(warm_wait, warm).await;
 
             // Cold re-check is identity-fenced too — never fall back to plain search.
-            return match self.vector_index.read().await.search_scoped_with(
-                query_embedding,
-                top_k,
-                repo,
-                &identity_key,
-                class,
-            ) {
+            let (recheck, mutating) = {
+                let vi = self.vector_index.read().await;
+                (
+                    vi.search_scoped_with(query_embedding, top_k, repo, &identity_key, class),
+                    vi.is_mutating(repo),
+                )
+            };
+            return match recheck {
                 ScopedSearch::Hit(found) => VectorSearchOutcome {
                     results: found.results,
                     warming: false,
                 },
+                // A run began while this query was warming (its install was
+                // refused at the fence): the stale snapshot answers instead.
+                ScopedSearch::Cold if mutating => {
+                    self.search_stale(query_embedding, top_k, repo, &identity_key, class)
+                        .await
+                }
                 ScopedSearch::IdentityMismatch(_) | ScopedSearch::Cold => VectorSearchOutcome {
                     results: Vec::new(),
                     warming: true,
@@ -1067,6 +1114,110 @@ impl IndexEngine {
         VectorSearchOutcome { results, warming }
     }
 
+    /// Search the stale snapshot of a repo whose live vectors are fenced by an
+    /// index run: the retained in-memory shard, else (cold worker) the last
+    /// persisted shard file of the same embedding identity. `warming` when there
+    /// is none — the caller then waits for the run like before.
+    async fn search_stale(
+        &self,
+        query_embedding: &[f32],
+        top_k: usize,
+        repo: &str,
+        identity_key: &str,
+        class: Option<&ScopeFilter>,
+    ) -> VectorSearchOutcome {
+        let search = |vi: &ShardedVectorIndex| {
+            vi.search_stale_with(query_embedding, top_k, repo, identity_key, class)
+        };
+        if let ScopedSearch::Hit(found) = search(&*self.vector_index.read().await) {
+            return VectorSearchOutcome {
+                results: found.results,
+                warming: false,
+            };
+        }
+        let data_dir = self.data_dir.clone();
+        let file_repo = repo.to_owned();
+        let file_identity = identity_key.to_owned();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::vector::shard_file::open_current_stale(&data_dir, &file_repo, &file_identity)
+        })
+        .await;
+        match loaded {
+            Ok(Ok(Some(index))) => {
+                self.vector_index
+                    .write()
+                    .await
+                    .install_stale(repo, index, identity_key.to_owned());
+                if let ScopedSearch::Hit(found) = search(&*self.vector_index.read().await) {
+                    info!(repo = %repo, "query answered from the persisted stale snapshot during an index run");
+                    return VectorSearchOutcome {
+                        results: found.results,
+                        warming: false,
+                    };
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => {
+                warn!(repo = %repo, error = %format!("{e:#}"), "stale snapshot unreadable")
+            }
+            Err(e) => warn!(repo = %repo, error = %e, "stale snapshot load panicked"),
+        }
+        if self.load_incremental_stale(repo, identity_key).await
+            && let ScopedSearch::Hit(found) = search(&*self.vector_index.read().await)
+        {
+            return VectorSearchOutcome {
+                results: found.results,
+                warming: false,
+            };
+        }
+        VectorSearchOutcome {
+            results: Vec::new(),
+            warming: true,
+        }
+    }
+
+    /// Cold worker inside an incremental window: the DB still holds every chunk
+    /// except the changed files', so load them as the stale snapshot (one
+    /// warm-equivalent scan, single-flight under the warm lock). Only for the
+    /// identity the run recorded; true when a snapshot is now available.
+    async fn load_incremental_stale(&self, repo: &str, identity_key: &str) -> bool {
+        let lock = self.get_warm_lock(repo).await;
+        let _guard = lock.lock().await;
+        {
+            let vi = self.vector_index.read().await;
+            if vi.has_stale(repo) {
+                return true;
+            }
+            if vi.incremental_identity(repo).as_deref() != Some(identity_key) {
+                return false;
+            }
+        }
+        let generation = self.settings_handle.read().await.repo_generation(repo);
+        let index = match store::get_or_open(&self.repo_dbs, &self.data_dir, repo, generation).await
+        {
+            Ok(db) => VectorIndex::load_from_db(&db).await,
+            Err(e) => Err(e),
+        };
+        match index {
+            Ok(index) => {
+                let count = index.len();
+                let installed = self.vector_index.write().await.install_stale(
+                    repo,
+                    index,
+                    identity_key.to_owned(),
+                );
+                if installed {
+                    info!(repo = %repo, count, "query answered from a DB stale snapshot during an incremental run");
+                }
+                installed
+            }
+            Err(e) => {
+                warn!(repo = %repo, error = %format!("{e:#}"), "stale snapshot load from DB failed");
+                false
+            }
+        }
+    }
+
     /// Per-repo async warm lock, lazily created. Mirrors `get_repo_lock`.
     async fn get_warm_lock(&self, repo: &str) -> Arc<Mutex<()>> {
         let mut locks = self.warm_locks.lock().await;
@@ -1089,8 +1240,10 @@ impl IndexEngine {
     ///
     /// The lock guard is released on every exit path (normal return, the inner
     /// `warm_repo_shard` error path, panic unwind, AND tokio task cancellation — the
-    /// future being dropped mid-`.await`, e.g. when the `vector_search` timeout
-    /// fires), so a dropped/aborted warm never strands the repo's warm lock.
+    /// future being dropped mid-`.await`, e.g. a runtime shutdown aborting the
+    /// detached warm task), so a dropped/aborted warm never strands the repo's
+    /// warm lock. `vector_search` runs it as its own task precisely so that its
+    /// bounded wait expiring does NOT cancel the load.
     async fn warm_repo_blocking(self: &Arc<Self>, repo: String, current: EmbeddingIdentity) {
         let lock = self.get_warm_lock(&repo).await;
         let _guard = lock.lock().await;
@@ -1125,10 +1278,29 @@ impl IndexEngine {
         .await
         {
             Ok(WarmResult::IdentityMismatch) => self.request_identity_rebuild(&repo).await,
+            Ok(WarmResult::IdentityUnknown) => self.request_identity_check(&repo).await,
             Ok(WarmResult::Installed(_) | WarmResult::MutationInProgress) => {}
             Err(e) => {
                 warn!(repo = %repo, error = %format!("{e:#}"), "warm: failed closed; shard remains unavailable")
             }
+        }
+    }
+
+    /// Queue one ordinary run for a repo whose identity marker is absent; the run
+    /// verifies the stored vectors and restores the marker (or rebuilds). Shares
+    /// the rebuild reservation, so concurrent cold queries queue it once.
+    async fn request_identity_check(&self, repo: &str) {
+        if !self.identity_rebuild.reserve(repo) {
+            return;
+        }
+        let trigger = IndexTrigger {
+            repo: repo.to_string(),
+            changes: None,
+            rebuild: false,
+        };
+        if let Err(e) = self.trigger_tx.send(trigger).await {
+            self.identity_rebuild.release(repo);
+            warn!(repo = %repo, error = %e, "failed to queue embedding-identity check");
         }
     }
 

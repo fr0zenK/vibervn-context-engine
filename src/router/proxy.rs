@@ -68,26 +68,51 @@ impl ProxyCtx {
 /// converged to `error` and everything else to `warming`. The distinction is
 /// carried in the message prefix `spawn failed:` set by `obtain_worker`.
 pub async fn acquire_and_proxy(ctx: &ProxyCtx, repo: &str, req: Request) -> Response {
-    // Single-flight acquire loop: a SpawnElected caller spawns; AwaitSpawn waits
-    // then re-acquires; Ready proxies. Bounded retries so a thrashing spawn can't
-    // loop forever.
-    let worker = match obtain_worker(ctx, repo).await {
-        Ok(w) => w,
-        Err(msg) => {
-            // A genuine spawn failure (process couldn't start / readiness
-            // timeout) is an ERROR the user must see + manually retry; a spawn
-            // that simply hasn't converged yet is WARMING (auto-retry). Map by
-            // the `spawn failed:` prefix obtain_worker sets on a hard failure.
-            if msg.starts_with("spawn failed:") {
-                warn!(repo = %repo, error = %msg, "worker spawn failed; surfacing error");
-                return error_response(&msg);
-            }
-            warn!(repo = %repo, error = %msg, "worker warming; signalling retry");
-            return warming_response(&msg);
-        }
+    let buffered = match buffer_request(req).await {
+        Ok(b) => b,
+        Err(msg) => return bad_body(msg),
     };
-    proxy_to(ctx, &worker, req).await
+    let mut attempt = 0;
+    loop {
+        // Single-flight acquire loop: a SpawnElected caller spawns; AwaitSpawn
+        // waits then re-acquires; Ready proxies. Bounded retries so a thrashing
+        // spawn can't loop forever.
+        let worker = match obtain_worker(ctx, repo).await {
+            Ok(w) => w,
+            Err(msg) => {
+                // A genuine spawn failure (process couldn't start / readiness
+                // timeout) is an ERROR the user must see + manually retry; a spawn
+                // that simply hasn't converged yet is WARMING (auto-retry). Map by
+                // the `spawn failed:` prefix obtain_worker sets on a hard failure.
+                if msg.starts_with("spawn failed:") {
+                    warn!(repo = %repo, error = %msg, "worker spawn failed; surfacing error");
+                    return error_response(&msg);
+                }
+                warn!(repo = %repo, error = %msg, "worker warming; signalling retry");
+                return warming_response(&msg);
+            }
+        };
+        match send_buffered(ctx, &worker, &buffered).await {
+            Ok(resp) => return resp,
+            Err(e) if attempt < WORKER_LOST_RETRIES => {
+                warn!(repo = %repo, port = worker.port, error = %e, "worker connection lost before a response; re-acquiring and retrying");
+                attempt += 1;
+                tokio::time::sleep(WORKER_LOST_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                warn!(repo = %repo, port = worker.port, error = %e, "proxy upstream connect failed; degrading");
+                return warming_response("worker connection lost; retry");
+            }
+        }
+    }
 }
+
+/// Retries when the worker vanished before answering — it crashed, or the idle
+/// reaper took it just as a request arrived. Only a request that got NO response
+/// is retried, after re-acquiring (which respawns a dead worker), so the
+/// caller sees an answer instead of a "connection lost; retry" 503.
+const WORKER_LOST_RETRIES: u32 = 1;
+const WORKER_LOST_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 /// SPAWN-BLOCKED proxy: proxy `req` to the repo's worker ONLY IF one is already
 /// live. Returns `None` (without spawning) when no worker is resident, so the
@@ -127,20 +152,27 @@ pub async fn forward_json_to_worker(
     path: &str,
     body: serde_json::Value,
 ) -> Result<String, String> {
-    let worker = obtain_worker(ctx, repo).await?;
-    let url = format!("http://127.0.0.1:{}{}", worker.port, path);
-    let resp = ctx
-        .client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("worker request failed: {e}"))?;
-    let raw = resp
-        .text()
-        .await
-        .map_err(|e| format!("worker response read failed: {e}"))?;
-    Ok(super::mcp_proxy::unwrap_mcp_tool_result(&raw))
+    let mut attempt = 0;
+    loop {
+        let worker = obtain_worker(ctx, repo).await?;
+        let url = format!("http://127.0.0.1:{}{}", worker.port, path);
+        let resp = match ctx.client.post(&url).json(&body).send().await {
+            Ok(resp) => resp,
+            // No response at all: see WORKER_LOST_RETRIES.
+            Err(e) if attempt < WORKER_LOST_RETRIES => {
+                warn!(repo = %repo, port = worker.port, error = %e, "worker connection lost before a response; re-acquiring and retrying");
+                attempt += 1;
+                tokio::time::sleep(WORKER_LOST_RETRY_DELAY).await;
+                continue;
+            }
+            Err(e) => return Err(format!("worker request failed: {e}")),
+        };
+        let raw = resp
+            .text()
+            .await
+            .map_err(|e| format!("worker response read failed: {e}"))?;
+        return Ok(super::mcp_proxy::unwrap_mcp_tool_result(&raw));
+    }
 }
 
 /// GET `path` on an ALREADY-LIVE worker for `repo` and return the parsed JSON
@@ -214,41 +246,75 @@ pub(crate) async fn obtain_worker(ctx: &ProxyCtx, repo: &str) -> Result<Arc<Read
     Err("worker spawn did not converge after retries".to_string())
 }
 
-/// Forward `req` to the worker and stream the response back.
-async fn proxy_to(ctx: &ProxyCtx, worker: &ReadyWorker, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
+/// A proxied request with its body read into memory, so it can be re-sent.
+struct BufferedRequest {
+    method: reqwest::Method,
+    path_and_query: String,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+}
 
-    // Rebuild the upstream URL: same path+query, worker's loopback port.
+/// Read `req` into a [`BufferedRequest`] (`Err`: why the body was unreadable,
+/// answered as a 400 by [`bad_body`]). Most proxied requests are small JSON;
+/// buffering the request body (not the response) costs nothing here and is
+/// what makes a retry possible.
+async fn buffer_request(req: Request) -> Result<BufferedRequest, String> {
+    let (parts, body) = req.into_parts();
     let path_and_query = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let upstream_uri = format!("http://127.0.0.1:{}{}", worker.port, path_and_query);
+        .unwrap_or("/")
+        .to_owned();
+    let body = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
+        Ok(b) => b,
+        Err(e) => return Err(format!("could not read request body: {e}")),
+    };
+    Ok(BufferedRequest {
+        method: reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+            .unwrap_or(reqwest::Method::GET),
+        path_and_query,
+        headers: parts.headers,
+        body,
+    })
+}
+
+fn bad_body(msg: String) -> Response {
+    (StatusCode::BAD_REQUEST, msg).into_response()
+}
+
+/// Forward `req` to the worker and stream the response back.
+async fn proxy_to(ctx: &ProxyCtx, worker: &ReadyWorker, req: Request) -> Response {
+    let buffered = match buffer_request(req).await {
+        Ok(b) => b,
+        Err(msg) => return bad_body(msg),
+    };
+    match send_buffered(ctx, worker, &buffered).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(port = worker.port, error = %e, "proxy upstream connect failed; degrading");
+            warming_response("worker connection lost; retry")
+        }
+    }
+}
+
+/// Send one buffered request to `worker` and stream its response back. `Err`
+/// only when no response arrived at all (the worker died or was reaped between
+/// acquire and send) — the one case a caller may safely retry.
+async fn send_buffered(
+    ctx: &ProxyCtx,
+    worker: &ReadyWorker,
+    req: &BufferedRequest,
+) -> Result<Response, reqwest::Error> {
+    // Rebuild the upstream URL: same path+query, worker's loopback port.
+    let upstream_uri = format!("http://127.0.0.1:{}{}", worker.port, req.path_and_query);
     let _ = upstream_uri.parse::<Uri>(); // validate shape; reqwest re-parses
 
-    // Collect the request body. Most proxied requests are small JSON; we buffer
-    // the request body (not the response) — streaming the request would add
-    // complexity for no benefit here (queries/index triggers are tiny POSTs).
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY).await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("could not read request body: {e}"),
-            )
-                .into_response();
-        }
-    };
-
-    // Translate method + headers.
-    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::GET);
     let mut upstream_req = ctx
         .client
-        .request(method, &upstream_uri)
-        .body(body_bytes.to_vec());
-    for (name, value) in parts.headers.iter() {
+        .request(req.method.clone(), &upstream_uri)
+        .body(req.body.to_vec());
+    for (name, value) in req.headers.iter() {
         // Skip hop-by-hop / host headers the upstream sets itself.
         let n = name.as_str().to_ascii_lowercase();
         if matches!(n.as_str(), "host" | "content-length" | "connection") {
@@ -259,15 +325,7 @@ async fn proxy_to(ctx: &ProxyCtx, worker: &ReadyWorker, req: Request) -> Respons
         }
     }
 
-    // Send. A connection error here means the worker died between acquire and
-    // proxy (rare — try_wait guards it); degrade to warming/retry.
-    let upstream_resp = match upstream_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(port = worker.port, error = %e, "proxy upstream connect failed; degrading");
-            return warming_response("worker connection lost; retry");
-        }
-    };
+    let upstream_resp = upstream_req.send().await?;
 
     // Build the downstream response, STREAMING the body (SSE-safe).
     let status =
@@ -293,9 +351,9 @@ async fn proxy_to(ctx: &ProxyCtx, worker: &ReadyWorker, req: Request) -> Respons
     // keeps SSE (`/index-events`) live end-to-end.
     let stream = upstream_resp.bytes_stream();
     let body = Body::from_stream(stream);
-    builder
+    Ok(builder
         .body(body)
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
 }
 
 /// Max proxied REQUEST body size (queries / index triggers / config are small).

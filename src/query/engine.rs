@@ -1156,13 +1156,25 @@ pub(crate) async fn hydrate_candidates(
 ) -> crate::query::content_fence::ContentFence {
     let mut chunks = Vec::with_capacity(candidates.len());
     for sr in candidates {
-        let (content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
+        let (mut content, symbol, symbol_fqn, symbol_kind) = fetch_chunk_content(
             db_map,
             &sr.chunk_id.file,
             sr.chunk_id.line_start,
             sr.chunk_id.line_end,
         )
         .await;
+        // The row is gone while an index run rewrites the file (the candidate
+        // came from the run's stale snapshot): the code itself is still on disk,
+        // and the answer is rendered from disk anyway. Only a file that no longer
+        // has those lines stays unresolved and is fenced below.
+        if crate::query::content_fence::is_unresolved_content(&content) {
+            content = read_source_lines(
+                &sr.chunk_id.file,
+                sr.chunk_id.line_start,
+                sr.chunk_id.line_end,
+            )
+            .await;
+        }
         chunks.push(MergeChunk {
             file: sr.chunk_id.file.clone(),
             line_start: sr.chunk_id.line_start,
@@ -1175,6 +1187,21 @@ pub(crate) async fn hydrate_candidates(
         });
     }
     crate::query::content_fence::apply(chunks)
+}
+
+/// Lines `line_start..=line_end` (1-based) of `file` as currently on disk, or ""
+/// when the file or those lines no longer exist.
+async fn read_source_lines(file: &str, line_start: u32, line_end: u32) -> String {
+    let Ok(text) = tokio::fs::read_to_string(file).await else {
+        return String::new();
+    };
+    let skip = line_start.saturating_sub(1) as usize;
+    let take = line_end.saturating_sub(line_start) as usize + 1;
+    text.lines()
+        .skip(skip)
+        .take(take)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn fetch_chunk_content(

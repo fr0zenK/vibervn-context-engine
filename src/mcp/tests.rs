@@ -592,6 +592,31 @@ fn merge_blocks_fallback_preserves_content_on_fs_failure() {
     assert_eq!(merged[0].content.matches("2: bbb").count(), 1);
 }
 
+// ─── prefix_output (readiness banner vs warming retry) ───────────────────
+
+/// REGRESSION: during Phase 2 a cold shard answered "(…showing vector-only
+/// results…)" followed by "still warming … retry" — a banner promising results
+/// above a body that has none. The warming retry must stand alone.
+#[test]
+fn graph_pending_prefix_is_dropped_for_warming_empty_answer() {
+    let warming = QueryOutput {
+        text: select_empty_or_warming_message(true, false, "q"),
+        warming_empty: true,
+    };
+    let out = prefix_output(crate::prompts::MCP_GRAPH_PENDING, warming);
+    assert!(!out.contains("vector-only"), "{out}");
+    assert!(out.contains("warming"), "{out}");
+}
+
+#[test]
+fn graph_pending_prefix_kept_for_real_results() {
+    let out = prefix_output(
+        crate::prompts::MCP_GRAPH_PENDING,
+        QueryOutput::from("src/a.rs#L1-2\n1: x".to_string()),
+    );
+    assert!(out.starts_with(crate::prompts::MCP_GRAPH_PENDING), "{out}");
+}
+
 // ─── select_empty_or_warming_message (warming-vs-empty signal) ───────────
 
 #[test]

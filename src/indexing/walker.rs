@@ -1,7 +1,9 @@
-use std::collections::HashSet;
-use std::path::{Component, Path};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
-use ignore::gitignore::GitignoreBuilder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{Match, WalkBuilder};
 use tracing::debug;
 
@@ -197,18 +199,60 @@ pub fn is_under_skip_dir(repo_root: &Path, path: &Path) -> bool {
 /// leak into the index on every incremental run. This re-applies the same rules
 /// so the watcher and full-rebuild paths agree on which files exist.
 ///
+/// Ignore files are honored at EVERY directory level, like the walker. A
+/// root-only matcher missed e.g. `NotepadADE/.gitignore: *build-*`, so each CMake
+/// build fed artifacts into an incremental run (and its call-graph phase) while
+/// a full rebuild correctly excluded them.
+///
 /// The watcher debounces filesystem events into a batch that can contain
-/// hundreds of paths (e.g. a `cargo build` rewriting `target/`). Rebuilding the
-/// gitignore matcher per path would re-read `.gitignore` from disk O(batch)
-/// times; this struct reads it once and reuses the compiled matcher, keeping the
-/// batch filter O(batch) with a single disk read.
+/// hundreds of paths (e.g. a `cargo build` rewriting `target/`). Each directory's
+/// ignore files are therefore read at most once per filter and every directory
+/// verdict is memoized, so a batch costs O(batch × depth) and never walks the
+/// repo. A filter is built per batch, so an edited ignore file is picked up by
+/// the next batch without any explicit invalidation.
 pub struct ChangeFilter {
     repo_root: std::path::PathBuf,
-    gitignore: ignore::gitignore::Gitignore,
     extra_extensions: Vec<String>,
     ignore_filenames: HashSet<String>,
     /// Per-repo ignored relative paths (forward-slash-normalized).
     ignore_paths: HashSet<String>,
+    /// Compiled ignore files per absolute directory, read lazily.
+    dir_ignores: RefCell<HashMap<PathBuf, Rc<DirIgnores>>>,
+    /// Memoized "this directory is ignored (or under an ignored one)" verdicts.
+    dir_ignored: RefCell<HashMap<PathBuf, bool>>,
+}
+
+/// The three ignore sources of one directory, in `ignore`-crate terms.
+struct DirIgnores {
+    /// `.augmentignore` (registered via `add_custom_ignore_filename`).
+    custom: Gitignore,
+    ignore: Gitignore,
+    git: Gitignore,
+    /// The directory contains `.git` (a dir, or a submodule's gitlink file).
+    has_git: bool,
+}
+
+impl DirIgnores {
+    fn load(dir: &Path) -> Self {
+        let build = |name: &str| {
+            let file = dir.join(name);
+            if !file.is_file() {
+                return Gitignore::empty();
+            }
+            let mut builder = GitignoreBuilder::new(dir);
+            let _ = builder.add(file);
+            builder.build().unwrap_or_else(|e| {
+                debug!(dir = ?dir, file = name, error = %e, "failed to build ignore matcher; nothing excluded by it");
+                Gitignore::empty()
+            })
+        };
+        Self {
+            custom: build(".augmentignore"),
+            ignore: build(".ignore"),
+            git: build(".gitignore"),
+            has_git: dir.join(".git").exists(),
+        }
+    }
 }
 
 impl ChangeFilter {
@@ -242,36 +286,108 @@ impl ChangeFilter {
         ignore_filenames: HashSet<String>,
         ignore_paths: HashSet<String>,
     ) -> Self {
-        let mut builder = GitignoreBuilder::new(repo_root);
-        let _ = builder.add(repo_root.join(".gitignore"));
-        let _ = builder.add(repo_root.join(".ignore"));
-        // `.augmentignore` added LAST so it ranks above `.gitignore`/`.ignore`:
-        // `GitignoreBuilder` applies patterns in add-order and a later match wins,
-        // so its patterns (including `!pattern` negation) override earlier files,
-        // letting a repo re-include something `.gitignore` excluded. ROOT-LEVEL
-        // only here — matching how `.gitignore`/`.ignore` are handled on this
-        // watcher/incremental path (the full-rebuild walker gets per-directory
-        // nesting via `add_custom_ignore_filename`). The extension allowlist,
-        // dot-dir, and SKIP_DIRS predicates still run first in `allows`, so `!`
-        // cannot resurrect files those layers already excluded.
-        let _ = builder.add(repo_root.join(".augmentignore"));
-        let gitignore = builder.build().unwrap_or_else(|e| {
-            debug!(error = %e, "failed to build gitignore matcher; nothing will be gitignore-excluded");
-            ignore::gitignore::Gitignore::empty()
-        });
         Self {
             repo_root: repo_root.to_path_buf(),
-            gitignore,
             extra_extensions,
             ignore_filenames,
             ignore_paths,
+            dir_ignores: RefCell::new(HashMap::new()),
+            dir_ignored: RefCell::new(HashMap::new()),
         }
+    }
+
+    fn ignores_of(&self, dir: &Path) -> Rc<DirIgnores> {
+        if let Some(found) = self.dir_ignores.borrow().get(dir) {
+            return Rc::clone(found);
+        }
+        let loaded = Rc::new(DirIgnores::load(dir));
+        self.dir_ignores
+            .borrow_mut()
+            .insert(dir.to_path_buf(), Rc::clone(&loaded));
+        loaded
+    }
+
+    /// `ignore`-crate precedence for one candidate, given its ancestor directories
+    /// ordered closest-first: the closest `.augmentignore` match wins over any
+    /// `.ignore` match, which wins over any `.gitignore` match. `.gitignore` files
+    /// stop applying above the nearest `.git` (a nested repo/submodule is its own
+    /// gitignore root); the other two keep applying across that boundary.
+    ///
+    /// Unlike the walker this does not require a `.git` at all for `.gitignore`
+    /// to apply — the watcher path always honored the root `.gitignore`, and
+    /// excluding a little more than the walker is the safe direction here.
+    fn is_ignored_by_files(&self, candidate: &Path, is_dir: bool, ancestors: &[PathBuf]) -> bool {
+        let (mut custom, mut ignore, mut git) = (Match::None, Match::None, Match::None);
+        let mut saw_git = false;
+        for dir in ancestors.iter().rev() {
+            let ig = self.ignores_of(dir);
+            if custom.is_none() {
+                custom = ig.custom.matched(candidate, is_dir).map(|_| ());
+            }
+            if ignore.is_none() {
+                ignore = ig.ignore.matched(candidate, is_dir).map(|_| ());
+            }
+            if !saw_git && git.is_none() {
+                git = ig.git.matched(candidate, is_dir).map(|_| ());
+            }
+            saw_git |= ig.has_git;
+        }
+        let decisive = if !custom.is_none() {
+            custom
+        } else if !ignore.is_none() {
+            ignore
+        } else {
+            git
+        };
+        decisive.is_ignore()
+    }
+
+    /// True if `path` (a file or directory) is excluded by an ignore file, either
+    /// itself or through any ancestor directory — a walk never descends into an
+    /// ignored directory, so a deeper `!` negation cannot resurrect its contents.
+    /// Directory verdicts are memoized, so each costs O(depth) once per filter.
+    fn is_gitignored(&self, path: &Path, is_dir: bool) -> bool {
+        let Ok(rel) = path.strip_prefix(&self.repo_root) else {
+            return false;
+        };
+        // Rebuild every ancestor from `repo_root` so matcher roots and candidates
+        // share one prefix form (config roots use `/`, notify paths use `\`).
+        let mut ancestors = vec![self.repo_root.clone()];
+        let components: Vec<_> = rel.components().collect();
+        let Some((last, dirs)) = components.split_last() else {
+            return false;
+        };
+        for component in dirs {
+            let dir = ancestors.last().expect("root is present").join(component);
+            let cached = self.dir_ignored.borrow().get(&dir).copied();
+            let ignored = match cached {
+                Some(v) => v,
+                None => {
+                    let v = self.is_ignored_by_files(&dir, true, &ancestors);
+                    self.dir_ignored.borrow_mut().insert(dir.clone(), v);
+                    v
+                }
+            };
+            if ignored {
+                return true;
+            }
+            ancestors.push(dir);
+        }
+        let candidate = ancestors.last().expect("root is present").join(last);
+        self.is_ignored_by_files(&candidate, is_dir, &ancestors)
     }
 
     /// Returns true if `path` passes every indexability rule (extension, dot-dir,
     /// SKIP_DIRS, gitignore, ignore filenames, per-repo ignore paths) and should
     /// therefore be indexed.
     pub fn allows(&self, path: &Path) -> bool {
+        self.allows_as(path, path.is_dir())
+    }
+
+    /// [`allows`](Self::allows) with the directory-ness supplied by the caller,
+    /// so checking many known files (e.g. every stored `file_meta` path) costs no
+    /// per-path `stat`.
+    pub fn allows_as(&self, path: &Path, is_dir: bool) -> bool {
         if !has_indexable_extension_with(path, &self.extra_extensions)
             || is_under_hidden_dir(&self.repo_root, path)
             || is_under_skip_dir(&self.repo_root, path)
@@ -291,11 +407,7 @@ impl ChangeFilter {
         {
             return false;
         }
-        let is_dir = path.is_dir();
-        !matches!(
-            self.gitignore.matched_path_or_any_parents(path, is_dir),
-            Match::Ignore(_)
-        )
+        !self.is_gitignored(path, is_dir)
     }
 
     /// True if directory `dir` is a place indexed files can live: not itself (or
@@ -319,10 +431,7 @@ impl ChangeFilter {
         {
             return false;
         }
-        !matches!(
-            self.gitignore.matched_path_or_any_parents(dir, true),
-            Match::Ignore(_)
-        )
+        !self.is_gitignored(dir, true)
     }
 }
 
@@ -332,8 +441,9 @@ impl ChangeFilter {
 /// Used when a whole directory appears in one watcher event (created, or moved
 /// into the repo): the directory's files never get individual events. The inner
 /// walk prunes like the full walker; the repo-root-relative rules (dot-dirs and
-/// SKIP_DIRS above `subdir`, the root ignore files, per-repo ignored paths) are
-/// re-applied with [`ChangeFilter`], since the inner walk is rooted at `subdir`.
+/// SKIP_DIRS above `subdir`, ignore files of `subdir`'s ancestors, per-repo
+/// ignored paths) are re-applied with [`ChangeFilter`], since the inner walk is
+/// rooted at `subdir`.
 /// Cost is O(subtree), never O(repo).
 pub fn walk_subtree_with(
     repo_root: &str,
@@ -979,5 +1089,124 @@ mod tests {
             filter.allows(&root.join("src").join("main.rs")),
             "src/main.rs control must pass"
         );
+    }
+
+    /// REGRESSION (notepad-ade): `NotepadADE/.gitignore: *build-*` lives below the
+    /// repo root. The root-only matcher let every CMake build feed `build-tdd/**`
+    /// into incremental runs, keeping the repo in phase 2 indefinitely.
+    #[test]
+    fn change_filter_honors_nested_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "tmp/\n").unwrap();
+        touch(root, "app/.gitignore");
+        fs::write(root.join("app/.gitignore"), "*build-*\n").unwrap();
+        touch(root, "app/build-tdd/gen/moc_main.cpp");
+        touch(root, "app/src/main.cpp");
+        touch(root, "other/build-x/keep.cpp");
+
+        let filter = ChangeFilter::new(root);
+        assert!(!filter.allows(&root.join("app/build-tdd/gen/moc_main.cpp")));
+        assert!(filter.allows(&root.join("app/src/main.cpp")));
+        assert!(
+            filter.allows(&root.join("other/build-x/keep.cpp")),
+            "a nested .gitignore must only govern its own subtree"
+        );
+        assert!(!filter.could_contain_indexed(&root.join("app/build-tdd")));
+        assert!(filter.could_contain_indexed(&root.join("app/src")));
+    }
+
+    /// The closest ignore file wins: a deeper `!` re-includes a file a shallower
+    /// `.gitignore` excluded, but cannot resurrect content under an ignored dir.
+    #[test]
+    fn change_filter_nested_negation_follows_walker_precedence() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "*.gen.rs\n/out\n").unwrap();
+        touch(root, "src/.gitignore");
+        fs::write(root.join("src/.gitignore"), "!keep.gen.rs\n").unwrap();
+        touch(root, "src/keep.gen.rs");
+        touch(root, "src/drop.gen.rs");
+        touch(root, "out/.gitignore");
+        fs::write(root.join("out/.gitignore"), "!*\n").unwrap();
+        touch(root, "out/x.rs");
+
+        let filter = ChangeFilter::new(root);
+        assert!(filter.allows(&root.join("src/keep.gen.rs")));
+        assert!(!filter.allows(&root.join("src/drop.gen.rs")));
+        assert!(!filter.allows(&root.join("out/x.rs")));
+    }
+
+    /// A nested git repo (submodule gitlink FILE) is its own `.gitignore` root:
+    /// the outer `.gitignore` stops applying inside it, `.augmentignore` does not.
+    #[test]
+    fn change_filter_gitignore_stops_at_nested_git_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log.rs\n").unwrap();
+        fs::write(root.join(".augmentignore"), "secret.rs\n").unwrap();
+        touch(root, "sub/.git");
+        fs::write(root.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        touch(root, "sub/a.log.rs");
+        touch(root, "sub/secret.rs");
+        touch(root, "top.log.rs");
+
+        let filter = ChangeFilter::new(root);
+        assert!(!filter.allows(&root.join("top.log.rs")));
+        assert!(filter.allows(&root.join("sub/a.log.rs")));
+        assert!(!filter.allows(&root.join("sub/secret.rs")));
+    }
+
+    /// Parity: on a tree with nested ignore files of every kind, the watcher filter
+    /// accepts exactly the files the full-rebuild walk returns.
+    #[test]
+    fn change_filter_matches_walk_repo_on_nested_ignores() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let files = [
+            ".gitignore",
+            "a.rs",
+            "skip.tmp.rs",
+            "app/.gitignore",
+            "app/.ignore",
+            "app/build-tdd/gen.cpp",
+            "app/src/main.cpp",
+            "app/src/local.rs",
+            "app/src/.augmentignore",
+            "app/src/skip.tmp.rs",
+            "app/data/x.json",
+            "sub/.git",
+            "sub/.gitignore",
+            "sub/skip.tmp.rs",
+            "sub/lib/y.rs",
+            "sub/out/z.rs",
+            "docs/readme.md",
+        ];
+        for f in files {
+            touch(root, f);
+        }
+        fs::write(root.join(".gitignore"), "*.tmp.rs\n").unwrap();
+        fs::write(root.join("app/.gitignore"), "*build-*\nlocal.rs\n").unwrap();
+        fs::write(root.join("app/.ignore"), "data/\n").unwrap();
+        fs::write(root.join("app/src/.augmentignore"), "!local.rs\n").unwrap();
+        fs::write(root.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        fs::write(root.join("sub/.gitignore"), "out/\n").unwrap();
+
+        let walked: HashSet<String> = walk_repo(root.to_str().unwrap())
+            .into_iter()
+            .map(|p| fwd(&p))
+            .collect();
+        let filter = ChangeFilter::new(root);
+        let filtered: HashSet<String> = files
+            .iter()
+            .map(|f| root.join(f))
+            .filter(|p| filter.allows(p))
+            .map(|p| fwd(p.to_str().unwrap()))
+            .collect();
+        assert_eq!(filtered, walked);
     }
 }

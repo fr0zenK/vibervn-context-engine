@@ -12,7 +12,9 @@
 //! 2. `repo_is_mutating` — the pipeline has entered its destructive window
 //!    (`ShardedVectorIndex::is_mutating`, set by `begin_full_update` /
 //!    `begin_incremental_update` BEFORE any delete). This is the only signal that
-//!    means "there is nothing safe to return".
+//!    means "the LIVE index is not safe to return". The previous index's snapshot
+//!    still is, when its completion stamp (4) is recent: an MCP call must answer
+//!    with code, and a slightly old answer beats "use grep" (`ServeStale`).
 //! 3. `chunk_count` — whether anything was ever indexed.
 //! 4. `last_indexed_ts` — durable completion stamp, for staleness.
 //!
@@ -41,14 +43,6 @@ use crate::store::{self, RepoDbMap};
 /// status map.
 pub(crate) const INDEX_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Warm budget granted to the vector-only fast path.
-///
-/// Phase 2 (`IndexPhase::ResolveEdges`) does not touch the vector shard, so the
-/// shard that is already resident is exactly what the query needs — there is
-/// nothing to wait for and blocking here would re-introduce the full-budget stall
-/// this fast path exists to avoid.
-pub(crate) const VECTOR_ONLY_WARM_BUDGET: Duration = Duration::ZERO;
-
 /// The single decision both query paths act on.
 ///
 /// Carrying the graph mode AND the remaining warm budget in one value is what
@@ -65,6 +59,11 @@ pub(crate) enum IndexReadiness {
     /// query must run in `QueryGraphMode::VectorOnly` and the surface must tell
     /// the user the graph is pending.
     ReadyVectorOnly { warm_budget: Duration },
+    /// A run has the live index fenced (or a failed run left it so) and the last
+    /// completed index is recent: query its stale snapshot vector-only, now, and
+    /// tell the user. If no snapshot turns out to exist the caller falls back to
+    /// [`wait_for_run`].
+    ReadyStale { warm_budget: Duration },
     /// The wait budget expired with a run still mid-flight. Nothing safe to serve.
     Timeout,
     /// The index run failed, or the repo DB could not be opened.
@@ -76,7 +75,7 @@ impl IndexReadiness {
     /// REST layer reports as `graph_pending` so the UI can badge it.
     #[cfg(test)]
     pub(crate) fn graph_pending(&self) -> bool {
-        matches!(self, Self::ReadyVectorOnly { .. })
+        matches!(self, Self::ReadyVectorOnly { .. } | Self::ReadyStale { .. })
     }
 
     /// Graph mode selected by the readiness decision.
@@ -84,7 +83,9 @@ impl IndexReadiness {
     pub(crate) fn graph_mode(&self) -> crate::query::engine::QueryGraphMode {
         match self {
             Self::Ready { .. } => crate::query::engine::QueryGraphMode::Full,
-            Self::ReadyVectorOnly { .. } => crate::query::engine::QueryGraphMode::VectorOnly,
+            Self::ReadyVectorOnly { .. } | Self::ReadyStale { .. } => {
+                crate::query::engine::QueryGraphMode::VectorOnly
+            }
             Self::Timeout | Self::Failed(_) => {
                 panic!("a non-queryable readiness has no graph mode")
             }
@@ -95,9 +96,9 @@ impl IndexReadiness {
     #[cfg(test)]
     pub(crate) fn warm_budget(&self) -> Option<Duration> {
         match self {
-            Self::Ready { warm_budget } | Self::ReadyVectorOnly { warm_budget } => {
-                Some(*warm_budget)
-            }
+            Self::Ready { warm_budget }
+            | Self::ReadyVectorOnly { warm_budget }
+            | Self::ReadyStale { warm_budget } => Some(*warm_budget),
             Self::Timeout | Self::Failed(_) => None,
         }
     }
@@ -141,12 +142,18 @@ pub(crate) async fn await_index_ready(
         .unwrap_or(None);
     let status = index_engine.repo_status(repo).await;
 
-    // Phase 2 fast path, checked BEFORE the freshness policy: the vector shard is
+    // Phase 2 fast path, checked BEFORE the freshness policy: the vectors are
     // final for this run, so waiting for edge resolution would burn the whole
     // budget for results that are already correct minus callers/callees.
+    //
+    // The shard is NOT necessarily resident, though: a worker that started (or
+    // evicted it) before this run stays cold, since an incremental publish only
+    // patches a resident shard. The full budget goes to warming it — a zero
+    // budget made every query during a long Phase 2 answer "still warming".
+    let full_budget = Duration::from_secs(settings.mcp_index_wait_secs);
     if is_resolve_edges_status(status.as_ref()) {
         return IndexReadiness::ReadyVectorOnly {
-            warm_budget: VECTOR_ONLY_WARM_BUDGET,
+            warm_budget: full_budget,
         };
     }
 
@@ -167,22 +174,35 @@ pub(crate) async fn await_index_ready(
     {
         return IndexReadiness::Failed(error);
     }
-    let full_budget = Duration::from_secs(settings.mcp_index_wait_secs);
+    if let QueryReadiness::ServeStale { .. } = readiness {
+        return IndexReadiness::ReadyStale {
+            warm_budget: full_budget,
+        };
+    }
     if !readiness.requires_wait() {
         return IndexReadiness::Ready {
             warm_budget: full_budget,
         };
     }
+    wait_for_run(index_engine, repo, full_budget).await
+}
 
-    let deadline = tokio::time::Instant::now() + full_budget;
+/// Block (bounded by `budget`) until the run owning `repo` leaves its destructive
+/// window, and say how the repo may then be queried.
+pub(crate) async fn wait_for_run(
+    index_engine: &Arc<IndexEngine>,
+    repo: &str,
+    budget: Duration,
+) -> IndexReadiness {
+    let deadline = tokio::time::Instant::now() + budget;
     loop {
         tokio::time::sleep(INDEX_READY_POLL_INTERVAL).await;
         let status = index_engine.repo_status(repo).await;
         // The run may reach phase 2 while we are blocked — take the fast path
-        // rather than waiting out edge resolution.
+        // rather than waiting out edge resolution, with whatever budget is left.
         if is_resolve_edges_status(status.as_ref()) {
             return IndexReadiness::ReadyVectorOnly {
-                warm_budget: VECTOR_ONLY_WARM_BUDGET,
+                warm_budget: deadline.saturating_duration_since(tokio::time::Instant::now()),
             };
         }
         match status.as_ref().map(|s| &s.state) {
@@ -237,18 +257,25 @@ pub(crate) enum QueryReadiness {
     /// stale, or a failed destructive run whose fence is still set) — trigger a
     /// run, then wait.
     TriggerThenWait,
+    /// The live index is being replaced (or a failed run left it fenced/emptied),
+    /// but the last COMPLETED index is within the staleness threshold: answer now
+    /// from that index's snapshot instead of waiting out the run. A recent
+    /// slightly-old answer beats "use grep". `trigger_repair` is set when no run
+    /// owns the repo, so the fenced state is not left in place.
+    ServeStale { trigger_repair: bool },
 }
 
 impl QueryReadiness {
     /// True when the stored index may be queried without waiting. Also the
     /// "had usable data before" predicate for the index-failed degrade path.
+    #[cfg(test)]
     pub(crate) fn serves_existing_index(self) -> bool {
         matches!(self, Self::ServeExisting { .. })
     }
 
     /// True when the caller must run the bounded wait loop before querying.
     pub(crate) fn requires_wait(self) -> bool {
-        !self.serves_existing_index()
+        matches!(self, Self::WaitForRun | Self::TriggerThenWait)
     }
 
     /// True when the caller must queue an index run.
@@ -258,6 +285,9 @@ impl QueryReadiness {
             Self::TriggerThenWait
                 | Self::ServeExisting {
                     refresh_in_background: true
+                }
+                | Self::ServeStale {
+                    trigger_repair: true
                 }
         )
     }
@@ -272,6 +302,11 @@ impl QueryReadiness {
 ///   must not punish the user), and backfill a stamp when nothing owns the repo
 /// * stamp within `stale_threshold` → serve
 /// * stamp older than `stale_threshold` → do not serve
+///
+/// When the first two rules withhold the live index but the durable stamp of the
+/// last completed run is within `stale_threshold`, the answer is
+/// [`QueryReadiness::ServeStale`] rather than a wait: `last_indexed_at` is only
+/// written after a run completes, so it dates the snapshot being served.
 pub(crate) fn evaluate(
     state: &RepoIndexState<'_>,
     stale_threshold: chrono::Duration,
@@ -293,6 +328,13 @@ pub(crate) fn evaluate(
     if serves_existing {
         return QueryReadiness::ServeExisting {
             refresh_in_background: parsed_stamp.is_none() && !state.run_state_is_indexing,
+        };
+    }
+    let last_run_is_recent =
+        parsed_stamp.is_some_and(|dt| (chrono::Utc::now() - dt) <= stale_threshold);
+    if last_run_is_recent && (state.repo_is_mutating || state.chunk_count == 0) {
+        return QueryReadiness::ServeStale {
+            trigger_repair: !state.run_state_is_indexing,
         };
     }
     if state.run_state_is_indexing {
@@ -416,10 +458,11 @@ mod tests {
         );
     }
 
-    /// The fail-closed direction: once the pipeline enters its destructive window,
-    /// chunks and a fresh stamp describe data being replaced and must NOT be served.
+    /// Inside the destructive window the LIVE index is never served, but a recent
+    /// last-completed index is: answered at once from its stale snapshot, with no
+    /// wait and no duplicate trigger behind the run that owns the repo.
     #[test]
-    fn fresh_timestamp_is_not_usable_inside_mutation_fence() {
+    fn fresh_timestamp_inside_mutation_fence_serves_stale() {
         let ts = ts_days_ago(1);
         let mut s = state(100, Some(&ts));
         s.run_state_is_indexing = true;
@@ -429,11 +472,38 @@ mod tests {
         assert!(!r.serves_existing_index());
         assert_eq!(
             r,
-            QueryReadiness::WaitForRun,
-            "the owning run must be awaited, not duplicated"
+            QueryReadiness::ServeStale {
+                trigger_repair: false
+            }
         );
-        assert!(r.requires_wait());
-        assert!(!r.requires_trigger());
+        assert!(!r.requires_wait());
+        assert!(!r.requires_trigger(), "a run already owns the repo");
+    }
+
+    /// "Not too old": a snapshot whose last completed run is past the staleness
+    /// threshold is not served — the query waits for the run instead.
+    #[test]
+    fn old_timestamp_inside_mutation_fence_waits() {
+        let ts = ts_days_ago(30);
+        let mut s = state(100, Some(&ts));
+        s.run_state_is_indexing = true;
+        s.repo_is_mutating = true;
+        assert_eq!(readiness(&s), QueryReadiness::WaitForRun);
+    }
+
+    /// A full rebuild has deleted every chunk: still serve the recent snapshot.
+    #[test]
+    fn emptied_by_running_rebuild_serves_stale() {
+        let ts = ts_days_ago(1);
+        let mut s = state(0, Some(&ts));
+        s.run_state_is_indexing = true;
+        s.repo_is_mutating = true;
+        assert_eq!(
+            readiness(&s),
+            QueryReadiness::ServeStale {
+                trigger_repair: false
+            }
+        );
     }
 
     /// Partially-written chunks during a destructive run are not usable either.
@@ -446,18 +516,33 @@ mod tests {
     }
 
     /// A failed destructive run leaves the fence set with no run owning the repo:
-    /// nothing is safe to serve AND nobody will repair it unless we trigger.
+    /// the live index is unusable and nobody will repair it unless we trigger —
+    /// but the recent snapshot still answers meanwhile.
     #[test]
-    fn stranded_mutation_fence_triggers_repair() {
+    fn stranded_mutation_fence_serves_stale_and_triggers_repair() {
         let ts = ts_days_ago(1);
         let mut s = state(100, Some(&ts));
         s.run_state_is_indexing = false;
         s.repo_is_mutating = true;
 
         let r = readiness(&s);
-        assert_eq!(r, QueryReadiness::TriggerThenWait);
+        assert_eq!(
+            r,
+            QueryReadiness::ServeStale {
+                trigger_repair: true
+            }
+        );
         assert!(r.requires_trigger());
-        assert!(r.requires_wait());
+        assert!(!r.requires_wait());
+    }
+
+    /// Stranded fence over an index past the threshold: repair, then wait.
+    #[test]
+    fn stranded_mutation_fence_on_old_index_triggers_then_waits() {
+        let ts = ts_days_ago(30);
+        let mut s = state(100, Some(&ts));
+        s.repo_is_mutating = true;
+        assert_eq!(readiness(&s), QueryReadiness::TriggerThenWait);
     }
 
     /// Never-indexed idle repo: trigger the first build, then wait.
@@ -528,13 +613,5 @@ mod tests {
         let failed = IndexReadiness::Failed(anyhow::anyhow!("boom"));
         assert!(!failed.graph_pending());
         assert_eq!(failed.warm_budget(), None);
-    }
-
-    /// The vector-only path must not block: phase 2 leaves the shard resident and
-    /// final, so any nonzero budget here would re-introduce the stall this fast
-    /// path exists to remove.
-    #[test]
-    fn vector_only_budget_does_not_block() {
-        assert_eq!(VECTOR_ONLY_WARM_BUDGET, Duration::ZERO);
     }
 }

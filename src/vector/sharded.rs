@@ -107,6 +107,20 @@ pub struct ShardedVectorIndex {
     /// vectors can be re-used when the delta publishes. Full rebuilds do not retain
     /// an old shard.
     pending_incremental: HashMap<String, Shard>,
+    /// Search-only copy of a repo's LAST PUBLISHED shard while a destructive update
+    /// hides the live one (a full rebuild, or a run that failed inside its window;
+    /// an incremental run's `pending_incremental` plays this role until publish).
+    /// Queries answer from it so an index run never turns retrieval into "use
+    /// grep"; results may lag the tree by one run, and readiness bounds how old the
+    /// index behind it may be. Never an incremental base: after a failed run it no
+    /// longer matches the DB. Like `pending_incremental` it is outside the resident
+    /// cap, and there is at most one per repo.
+    stale: HashMap<String, Shard>,
+    /// Embedding identity of an incremental run in progress. Its window only
+    /// deletes the changed files' rows, so a cold worker can still build a stale
+    /// snapshot from the DB; the run only exists because the stored identity
+    /// equals this one, which makes it the snapshot's identity.
+    incremental_identity: HashMap<String, String>,
     /// Per-repo mutation epoch, bumped whenever a repo's vectors change (update
     /// begin/publish/abort, direct removals). A warm captures it before its DB scan
     /// and installs only if it is unchanged: `mutating_repos` alone cannot catch an
@@ -131,6 +145,8 @@ impl ShardedVectorIndex {
             shards: HashMap::new(),
             mutating_repos: HashSet::new(),
             pending_incremental: HashMap::new(),
+            stale: HashMap::new(),
+            incremental_identity: HashMap::new(),
             epochs: HashMap::new(),
             clock: AtomicU64::new(0),
             cap_bytes,
@@ -203,15 +219,48 @@ impl ShardedVectorIndex {
         *self.epochs.entry(repo_key.to_owned()).or_insert(0) += 1;
     }
 
-    /// Begin a full rebuild before `delete_all_data` runs. The old shard becomes
-    /// immediately unsearchable and is dropped; warm cannot install a replacement
-    /// until the pipeline publishes successfully.
+    /// Begin a full rebuild before `delete_all_data` runs. The old shard leaves the
+    /// live path (it is kept only as the search-only stale snapshot); warm cannot
+    /// install a replacement until the pipeline publishes successfully.
     pub fn begin_full_update(&mut self, repo: &str) {
         let repo = Self::repo_key(repo);
         self.bump_epoch(&repo);
-        self.shards.remove(&repo);
-        self.pending_incremental.remove(&repo);
+        let old = self.shards.remove(&repo);
+        let pending = self.pending_incremental.remove(&repo);
+        self.retain_stale(&repo, old.or(pending));
+        self.incremental_identity.remove(&repo);
         self.mutating_repos.insert(repo);
+    }
+
+    /// Record the identity of the incremental run that just began on `repo`
+    /// (see `incremental_identity`).
+    pub fn note_incremental_identity(&mut self, repo: &str, identity: String) {
+        let repo = Self::repo_key(repo);
+        if self.mutating_repos.contains(&repo) {
+            self.incremental_identity.insert(repo, identity);
+        }
+    }
+
+    /// Identity under which a stale snapshot may be rebuilt from the DB rows that
+    /// survive the current incremental window, if one is in progress.
+    pub fn incremental_identity(&self, repo: &str) -> Option<String> {
+        self.incremental_identity
+            .get(&Self::repo_key(repo))
+            .cloned()
+    }
+
+    /// True when `repo` has a stale snapshot to answer from.
+    pub fn has_stale(&self, repo: &str) -> bool {
+        let repo = Self::repo_key(repo);
+        self.pending_incremental.contains_key(&repo) || self.stale.contains_key(&repo)
+    }
+
+    /// Keep `shard` as the repo's search-only stale snapshot. An existing snapshot
+    /// (left by an earlier failed run) is only replaced by a newer shard.
+    fn retain_stale(&mut self, repo: &str, shard: Option<Shard>) {
+        if let Some(shard) = shard {
+            self.stale.insert(repo.to_owned(), shard);
+        }
     }
 
     /// Begin an incremental update before affected chunk rows are deleted. The old
@@ -258,6 +307,8 @@ impl ShardedVectorIndex {
         let repo = Self::repo_key(repo);
         self.bump_epoch(&repo);
         self.pending_incremental.remove(&repo);
+        self.stale.remove(&repo);
+        self.incremental_identity.remove(&repo);
         self.replace_repo(&repo, new_vectors, identity, active);
         self.mutating_repos.remove(&repo);
     }
@@ -283,18 +334,69 @@ impl ShardedVectorIndex {
             self.shards.insert(repo.clone(), shard);
             self.apply_incremental(&repo, removed_files, new_vectors, identity, active);
         }
+        self.stale.remove(&repo);
+        self.incremental_identity.remove(&repo);
         self.bump_epoch(&repo);
         self.mutating_repos.remove(&repo);
     }
 
-    /// Keep the repo fail-closed after a failed run while dropping any hidden old
-    /// shard. A later successful full rebuild releases the mutation fence.
+    /// Keep the repo fail-closed after a failed run: the live shard and the hidden
+    /// incremental base are retired (they no longer match the DB), but the newest
+    /// of them stays searchable as the stale snapshot. A later successful run
+    /// releases the mutation fence.
     pub fn abort_update_fail_closed(&mut self, repo: &str) {
         let repo = Self::repo_key(repo);
         self.bump_epoch(&repo);
-        self.shards.remove(&repo);
-        self.pending_incremental.remove(&repo);
+        let live = self.shards.remove(&repo);
+        let pending = self.pending_incremental.remove(&repo);
+        self.retain_stale(&repo, live.or(pending));
+        self.incremental_identity.remove(&repo);
         self.mutating_repos.insert(repo);
+    }
+
+    /// Install a stale snapshot loaded from the persisted shard file, for a repo
+    /// that is mid-update with nothing searchable in memory (cold worker). Returns
+    /// false (and drops `index`) if the repo is not mutating or already has one.
+    pub fn install_stale(&mut self, repo: &str, index: VectorIndex, identity: String) -> bool {
+        let repo = Self::repo_key(repo);
+        if index.is_empty()
+            || !self.mutating_repos.contains(&repo)
+            || self.pending_incremental.contains_key(&repo)
+            || self.stale.contains_key(&repo)
+        {
+            return false;
+        }
+        let stamp = self.next_stamp();
+        self.stale.insert(repo, Shard::new(index, identity, stamp));
+        true
+    }
+
+    /// Search the stale snapshot of a repo that is mid-update: the hidden
+    /// incremental base, else the retained/loaded snapshot. Identity-fenced like
+    /// the live path; `Cold` when there is none.
+    pub fn search_stale_with(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        repo: &str,
+        expected_identity: &str,
+        scope: Option<&ScopeFilter>,
+    ) -> ScopedSearch {
+        let repo = Self::repo_key(repo);
+        let Some(shard) = self
+            .pending_incremental
+            .get(&repo)
+            .or_else(|| self.stale.get(&repo))
+        else {
+            return ScopedSearch::Cold;
+        };
+        if shard.identity != expected_identity {
+            return ScopedSearch::IdentityMismatch(shard.identity.clone());
+        }
+        ScopedSearch::Hit(ShardedSearch {
+            results: shard.index.search_filtered(query, top_k, scope),
+            cold_repos: Vec::new(),
+        })
     }
 
     // ── Recency bookkeeping ──────────────────────────────────────────────────
@@ -637,6 +739,9 @@ impl ShardedVectorIndex {
     pub fn remove_repo(&mut self, repo: &str) {
         let repo = Self::repo_key(repo);
         self.shards.remove(&repo);
+        self.pending_incremental.remove(&repo);
+        self.stale.remove(&repo);
+        self.incremental_identity.remove(&repo);
         // Defensive: also clear vectors physically inside the repo from any shard
         // (covers nested-path edge cases consistent with the old merged-index
         // `remove_repo` semantics at vector/mod.rs).
